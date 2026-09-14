@@ -227,6 +227,7 @@ def record_success(
     image.current_scan_run_id = run.id
     image.last_scan_at = meta.completed_at
     image.last_scan_status = RunStatus.SUCCESS
+    image.consecutive_failures = 0
     session.flush()
 
     _recompute_cve_rollup(session, affected)
@@ -247,19 +248,37 @@ def record_skip(
 
     image.last_scan_at = meta.completed_at
     image.last_scan_status = RunStatus.SKIPPED
+    # A skip means the digest resolved and nothing had changed, so the image is
+    # demonstrably healthy -- it clears the failure streak exactly like a success.
+    image.consecutive_failures = 0
     session.flush()
     return run
 
 
 def record_failure(
-    session: Session, image: Image, job: ScanJob | None, meta: RunMetadata, error: str
+    session: Session,
+    image: Image,
+    job: ScanJob | None,
+    meta: RunMetadata,
+    error: str,
+    *,
+    exhausted: bool = False,
 ) -> ScanRun:
-    """Record a failed attempt without disturbing the last good findings."""
+    """Record a failed attempt without disturbing the last good findings.
+
+    ``exhausted`` says the *job* gave up, not merely that this attempt failed. The
+    failure streak counts jobs rather than attempts because a job already backs off
+    across its own retries: counting every attempt would let one transient registry
+    blip burn five retries in eight minutes and push a perfectly healthy image onto a
+    multi-hour cadence.
+    """
     run = _new_run(image, job, RunStatus.FAILED, meta, error=error[:4000])
     session.add(run)
     session.flush()
 
     image.last_scan_at = meta.completed_at
     image.last_scan_status = RunStatus.FAILED
+    if exhausted:
+        image.consecutive_failures = (image.consecutive_failures or 0) + 1
     session.flush()
     return run

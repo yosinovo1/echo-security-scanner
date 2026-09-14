@@ -48,6 +48,9 @@ class ImageSummary(BaseModel):
     digest: str | None = None
     last_scan_at: datetime | None = None
     last_scan_status: RunStatus | None = None
+    #: Consecutive failed jobs. Non-zero means this image is being scanned on a
+    #: backed-off schedule, and a large value means the reference needs attention.
+    consecutive_failures: int = 0
     scan_interval_seconds: int = Field(
         description="Effective interval, including the global default."
     )

@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # image.scan_interval_seconds.
     default_scan_interval_seconds: int = 900
     scheduler_tick_seconds: int = 10
+    #: Ceiling for the per-image backoff applied to an image whose scans keep failing.
+    #: A reference that has genuinely disappeared settles at one attempt a day rather
+    #: than ninety-six, while still recovering on its own if the tag comes back.
+    max_failure_backoff_seconds: int = 86400
 
     # Worker.
     worker_poll_seconds: int = 5

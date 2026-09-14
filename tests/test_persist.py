@@ -249,6 +249,38 @@ class TestFailureIsolation:
         assert {f.cve_id for f in current_findings(session, image)} == {cve}
         assert image.last_scan_status == RunStatus.FAILED
 
+    def test_an_exhausted_job_extends_the_failure_streak(self, session, image):
+        for expected in (1, 2, 3):
+            persist.record_failure(
+                session, image, None, meta(digest=None), error="gone", exhausted=True
+            )
+            assert image.consecutive_failures == expected
+
+    def test_a_failed_attempt_that_will_be_retried_does_not_count(self, session, image):
+        # The job backs off across its own retries; counting every attempt would let
+        # one transient blip push a healthy image onto a multi-hour cadence.
+        for _ in range(5):
+            persist.record_failure(
+                session, image, None, meta(digest=None), error="flaky", exhausted=False
+            )
+        assert image.consecutive_failures == 0
+
+    def test_a_success_clears_the_streak(self, session, image):
+        persist.record_failure(
+            session, image, None, meta(digest=None), error="gone", exhausted=True
+        )
+        persist.record_success(session, image, None, report(finding(cve_id())), meta())
+        assert image.consecutive_failures == 0
+
+    def test_a_skip_clears_the_streak_too(self, session, image):
+        # A skip means the digest resolved and nothing changed, which is proof the
+        # image is reachable -- exactly as healthy as a success for this purpose.
+        persist.record_failure(
+            session, image, None, meta(digest=None), error="gone", exhausted=True
+        )
+        persist.record_skip(session, image, None, meta(), reason="unchanged")
+        assert image.consecutive_failures == 0
+
     def test_the_error_is_stored_as_a_queryable_row(self, session, image):
         persist.record_failure(session, image, None, meta(digest=None), error="trivy exploded")
         run = session.execute(

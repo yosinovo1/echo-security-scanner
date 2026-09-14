@@ -36,7 +36,7 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def next_due_at(image: Image, default_interval: int) -> datetime:
+def next_due_at(image: Image, default_interval: int, *, max_failure_backoff: int) -> datetime:
     """When this image should next be scanned.
 
     A never-scanned image is due immediately. There is deliberately no cold-start
@@ -44,10 +44,21 @@ def next_due_at(image: Image, default_interval: int) -> datetime:
     queue rows, and concurrency is still bounded by worker replica count and the
     registry itself, so spreading the enqueue only delays the first results. The
     steady-state spread comes free from the rate at which the queue drains.
+
+    An image whose jobs keep failing backs off exponentially. ``queue.fail`` already
+    does this *within* a job; without the same thing here, a reference that has been
+    deleted from its registry is re-enqueued on the dot every interval forever --
+    ninety-six registry requests and rows a day, for an answer that will not change.
+    Backoff rather than disabling, because a tag that does not exist today may exist
+    tomorrow, and the fix should not require a human with a SQL prompt.
     """
     interval = image.scan_interval_seconds or default_interval
     if image.last_scan_at is None:
         return image.created_at
+
+    failures = image.consecutive_failures or 0
+    if failures:
+        interval = min(interval * 2**failures, max_failure_backoff)
     return image.last_scan_at + timedelta(seconds=interval)
 
 
@@ -63,7 +74,14 @@ def due_images(session: Session, settings: Settings) -> list[Image]:
     )
     now = _now()
     interval = settings.default_scan_interval_seconds
-    return [i for i in candidates if next_due_at(i, interval) <= now]
+    return [
+        i
+        for i in candidates
+        if next_due_at(
+            i, interval, max_failure_backoff=settings.max_failure_backoff_seconds
+        )
+        <= now
+    ]
 
 
 def tick(session: Session, settings: Settings) -> int:

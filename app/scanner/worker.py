@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.db.session import sync_session
-from app.domain.models import Image, RunStatus, ScanJob, ScanRun
+from app.domain.models import Image, JobStatus, RunStatus, ScanJob, ScanRun
 from app.jobs import queue
 from app.registry.digest import (
     ImageNotFound,
@@ -167,6 +167,20 @@ def _record_failure(
     image = session.get(Image, job.image_id)
     message = f"{type(error).__name__}: {error}"
 
+    # Resolved before the run is recorded, because whether the *job* gave up is what
+    # the image-level failure streak counts -- not whether this one attempt failed.
+    queue.fail(
+        session,
+        job,
+        message,
+        # A reference that does not exist will not start existing on retry, so burn
+        # the allowance immediately rather than backing off five times.
+        max_attempts=1 if permanent else settings.max_attempts,
+        backoff_base_seconds=settings.backoff_base_seconds,
+        backoff_max_seconds=settings.backoff_max_seconds,
+    )
+    exhausted = job.status == JobStatus.FAILED
+
     if image is not None:
         persist.record_failure(
             session,
@@ -181,20 +195,14 @@ def _record_failure(
                 completed_at=_now(),
             ),
             error=message,
+            exhausted=exhausted,
         )
 
-    queue.fail(
-        session,
-        job,
-        message,
-        # A reference that does not exist will not start existing on retry, so burn
-        # the allowance immediately rather than backing off five times.
-        max_attempts=1 if permanent else settings.max_attempts,
-        backoff_base_seconds=settings.backoff_base_seconds,
-        backoff_max_seconds=settings.backoff_max_seconds,
-    )
     session.commit()
-    log.warning("job %s failed (permanent=%s): %s", job.id, permanent, message)
+    log.warning(
+        "job %s failed (permanent=%s, exhausted=%s): %s",
+        job.id, permanent, exhausted, message,
+    )
 
 
 def run_once(session: Session, settings: Settings) -> bool:

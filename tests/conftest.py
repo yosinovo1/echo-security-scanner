@@ -43,6 +43,11 @@ def engine():
 
     base, _, _ = settings.sync_dsn.rpartition("/")
     engine = create_engine(f"{base}/{test_db}", pool_pre_ping=True)
+    # Rebuilt from the models every session rather than migrated into place:
+    # create_all adds missing *tables* but never missing *columns*, so adding a column
+    # would otherwise surface as UndefinedColumn across the whole suite for anyone who
+    # had run the tests before. Nothing in this database is worth keeping between runs.
+    Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     return engine
 

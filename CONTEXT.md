@@ -13,6 +13,18 @@ An Image is a *subscription*, not an artifact: it names something to keep scanni
 The artifact it currently points at is the [Digest](#digest), and that can change
 underneath a stable name and tag.
 
+### Failure streak
+
+How many consecutive [Scan Jobs](#scan-job) for an Image have been *exhausted* —
+given up on after using all their attempts. Any Success or Skip resets it to zero.
+
+It counts exhausted Jobs rather than failed attempts, because a Job already retries
+internally: a single bad minute at a registry should not read as a failing Image. The
+streak is what widens the interval between attempts, so an Image whose reference has
+genuinely disappeared is retried about once a day instead of every fifteen minutes —
+while still recovering by itself if the reference comes back, which is why the streak
+slows an Image down rather than switching it off.
+
 ## Tag
 
 The mutable half of an Image's identity. A tag is a pointer maintained by whoever

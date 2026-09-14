@@ -229,6 +229,26 @@ class TestListImages:
         assert unscanned["total_cves"] == 0
         assert unscanned["digest"] is None
 
+    async def test_a_healthy_image_reports_no_failure_streak(self, client, seeded):
+        payload = (await client.get("/api/images", params={"limit": 1000})).json()
+        assert items_by_name(payload)[seeded.alpha.name]["consecutive_failures"] == 0
+
+    async def test_the_failure_streak_is_visible(self, client, seeded, engine):
+        # A rotting reference should be findable from the API, not just cheap: this is
+        # the field that says "a human needs to look at this image".
+        from sqlalchemy.orm import Session as SyncSession
+
+        with SyncSession(bind=engine) as setup:
+            setup.execute(
+                Image.__table__.update()
+                .where(Image.__table__.c.id == seeded.unscanned.id)
+                .values(consecutive_failures=4)
+            )
+            setup.commit()
+
+        payload = (await client.get("/api/images", params={"limit": 1000})).json()
+        assert items_by_name(payload)[seeded.unscanned.name]["consecutive_failures"] == 4
+
     async def test_effective_interval_includes_the_global_default(self, client, seeded):
         payload = (await client.get("/api/images", params={"limit": 1000})).json()
         assert items_by_name(payload)[seeded.alpha.name]["scan_interval_seconds"] == 900

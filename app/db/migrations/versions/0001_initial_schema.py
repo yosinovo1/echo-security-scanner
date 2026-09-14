@@ -39,6 +39,9 @@ def upgrade() -> None:
         # Plain BigInteger, not an FK: image and scan_run would otherwise reference
         # each other, and the pointer is maintained in the same transaction anyway.
         sa.Column("current_scan_run_id", sa.BigInteger(), nullable=True),
+        sa.Column(
+            "consecutive_failures", sa.Integer(), server_default=sa.text("0"), nullable=False
+        ),
         sa.Column("last_scan_at", TS, nullable=True),
         sa.Column("last_scan_status", RUN_STATUS, nullable=True),
         sa.Column("created_at", TS, server_default=sa.func.now(), nullable=False),

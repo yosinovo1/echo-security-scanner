@@ -17,6 +17,8 @@ import argparse
 import subprocess
 import sys
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import httpx
@@ -34,7 +36,16 @@ BRIEF_IMAGES = [
     ("httpd", "2.4"),
 ]
 
-BOGUS_IMAGE = ("nginx", "definitely-not-a-real-tag")
+#: Requirement 1.6 is proven by causing a real failure, which means writing to the
+#: live database -- the running stack is the subject, so there is no test database to
+#: hide in the way ``tests/conftest.py`` does. The hygiene is borrowed instead: a
+#: uuid-suffixed name that cannot collide, and guaranteed teardown. The shared prefix
+#: is what lets a later run sweep up after one that was interrupted.
+EPHEMERAL_TAG_PREFIX = "verify-ephemeral-"
+
+#: A real repository with a tag that cannot exist, so the 404 proves tag-level
+#: resolution rather than a bad repository name.
+EPHEMERAL_IMAGE_NAME = "nginx"
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 
@@ -72,6 +83,43 @@ def psql(sql: str) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"psql failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def drop_ephemeral_images() -> int:
+    """Remove every image this script has ever registered.
+
+    ``scan_job``, ``scan_run`` and ``finding`` all cascade from ``image``, so this is
+    the whole teardown. Safe to call when there is nothing to drop.
+    """
+    dropped = psql(
+        f"WITH gone AS (DELETE FROM image WHERE tag LIKE '{EPHEMERAL_TAG_PREFIX}%' "
+        "RETURNING 1) SELECT count(*) FROM gone"
+    )
+    return int(dropped or 0)
+
+
+@contextmanager
+def ephemeral_image():
+    """Register an unresolvable image for the duration of the failure-path check.
+
+    Swept on the way in as well as out: a run killed midway would otherwise leave a
+    permanently-failing image behind, and the next run would be verifying a system
+    the previous run degraded.
+    """
+    leftover = drop_ephemeral_images()
+    if leftover:
+        print(f"  {DIM}cleaned up {leftover} image(s) from an interrupted run{RESET}")
+
+    name = EPHEMERAL_IMAGE_NAME
+    tag = f"{EPHEMERAL_TAG_PREFIX}{uuid.uuid4().hex[:12]}"
+    psql(f"INSERT INTO image (name, tag) VALUES ('{name}', '{tag}')")
+    try:
+        yield name, tag
+    finally:
+        # Only reached once the failure has been recorded, so the job has reached a
+        # terminal state and the cascade cannot delete a row a worker is holding.
+        drop_ephemeral_images()
+        print(f"  {DIM}removed {name}:{tag}{RESET}")
 
 
 def wait_for_scans(client: httpx.Client, timeout: int) -> bool:
@@ -113,8 +161,9 @@ def check_scanner(client: httpx.Client, report: Report, use_db: bool) -> None:
     report.check("1.1", "all 10 brief images are registered", not missing,
                  f"missing: {missing}" if missing else f"{len(BRIEF_IMAGES)} images present")
 
-    # Only the brief's images count: a --with-db run leaves a deliberately
-    # unresolvable image behind, and it must not dilute the coverage number.
+    # Only the brief's images count. The failure-path check tidies up after itself,
+    # but an operator is free to add images of their own and those must not dilute
+    # the coverage number either.
     brief = [i for i in images if (i["name"], i["tag"]) in set(BRIEF_IMAGES)]
     scanned = [i for i in brief if i["last_scan_status"] in ("success", "skipped")]
     unscanned = [f"{i['name']}:{i['tag']}" for i in brief if i not in scanned]
@@ -156,31 +205,27 @@ def check_scanner(client: httpx.Client, report: Report, use_db: bool) -> None:
     # register an image that cannot resolve and confirm the failure is recorded and
     # the queue keeps moving.
     print(f"  {DIM}seeding an unresolvable image to exercise the failure path...{RESET}")
-    name, tag = BOGUS_IMAGE
-    psql(
-        f"INSERT INTO image (name, tag) VALUES ('{name}', '{tag}') "
-        "ON CONFLICT ON CONSTRAINT uq_image_name_tag DO NOTHING"
-    )
-    client.post(f"/api/images/{name}/{tag}/scan", params={"time_sensitive": "true"})
+    with ephemeral_image() as (name, tag):
+        client.post(f"/api/images/{name}/{tag}/scan", params={"time_sensitive": "true"})
 
-    deadline = time.time() + 180
-    failed_row = ""
-    while time.time() < deadline:
-        failed_row = psql(
-            "SELECT r.status, coalesce(left(r.error, 90), '') FROM scan_run r "
-            f"JOIN image i ON i.id = r.image_id WHERE i.tag = '{tag}' "
-            "ORDER BY r.id DESC LIMIT 1"
-        )
-        if failed_row:
-            break
-        time.sleep(5)
+        deadline = time.time() + 180
+        failed_row = ""
+        while time.time() < deadline:
+            failed_row = psql(
+                "SELECT r.status, coalesce(left(r.error, 90), '') FROM scan_run r "
+                f"JOIN image i ON i.id = r.image_id WHERE i.tag = '{tag}' "
+                "ORDER BY r.id DESC LIMIT 1"
+            )
+            if failed_row:
+                break
+            time.sleep(5)
 
-    report.check("1.6", "scan failure is recorded, not swallowed", "failed" in failed_row,
-                 failed_row or "no scan_run row appeared within 180s")
+        report.check("1.6", "scan failure is recorded, not swallowed", "failed" in failed_row,
+                     failed_row or "no scan_run row appeared within 180s")
 
-    still_ok = client.get("/health").json().get("status") == "ok"
-    report.check("1.7", "a failing image does not wedge the queue", still_ok,
-                 "health still ok after the failure")
+        still_ok = client.get("/health").json().get("status") == "ok"
+        report.check("1.7", "a failing image does not wedge the queue", still_ok,
+                     "health still ok after the failure")
 
 
 # --------------------------------------------------------------------------

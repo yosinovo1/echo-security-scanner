@@ -60,6 +60,7 @@ async def list_images(
             tag=image.tag,
             last_scan_at=image.last_scan_at,
             last_scan_status=image.last_scan_status,
+            consecutive_failures=image.consecutive_failures,
             scan_interval_seconds=image.scan_interval_seconds
             or settings.default_scan_interval_seconds,
             severity_counts=SeverityCounts(),

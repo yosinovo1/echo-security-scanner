@@ -130,6 +130,7 @@ curl -s localhost:8000/api/images | jq
       "last_scan_at": "2026-09-14T10:41:55.201Z",
       "last_scan_status": "success",
       "scan_interval_seconds": 900,
+      "consecutive_failures": 0,
       "total_cves": 4,
       "severity_counts": { "CRITICAL": 0, "HIGH": 2, "MEDIUM": 1, "LOW": 1, "UNKNOWN": 0 }
     }
@@ -252,7 +253,7 @@ image ──┬──< scan_job          one active job per image, enforced by a
 
 | Table | Holds |
 |---|---|
-| `image` | The watch list: `(name, tag)`, optional per-image interval, and pointers to the current run and last scan status. |
+| `image` | The watch list: `(name, tag)`, optional per-image interval, pointers to the current run and last scan status, and `consecutive_failures` for the per-image backoff. |
 | `scan_job` | The queue. Status, priority, `scheduled_for`, `lease_until`, `attempts`. |
 | `scan_run` | One row per attempt, with the four fields that form the skip invariant plus duration and error. |
 | `package` | `(name, version, type)` — `type` is the ecosystem, so `openssl` as a Debian package and as a Python package are distinct. |
@@ -401,6 +402,41 @@ now driven by the only party that actually knows the limit.
 > answer there is authentication or a pull-through mirror, not a smarter counter. See
 > [Known limitations](#known-limitations).
 
+### Retries back off per image, not just per job
+
+`queue.fail` backs a job off exponentially across its own attempts. That was only
+half the problem, and the missing half was invisible until an image was watched for
+an afternoon: a *permanently* failed job releases the partial unique index, the
+scheduler sees the image is due again one interval later, and enqueues a brand new
+job with `attempts = 0` and no memory that the last four hundred attempts all
+returned `ImageNotFound`.
+
+So a reference deleted from its registry cost **96 registry requests, 96 `scan_job`
+rows and 96 `scan_run` rows a day, forever**, while never surfacing anywhere as
+needing attention. The careful reasoning in the worker — *"a reference that does not
+exist will not start existing on retry, so burn the allowance immediately"* — was
+being undone one layer up.
+
+`image.consecutive_failures` closes it: the wait becomes
+`interval × 2^failures`, capped at a day, and any success **or skip** clears the
+streak. A dead reference settles at one attempt a day instead of ninety-six.
+
+Two decisions inside that are worth stating:
+
+- **It counts jobs, not attempts.** A job already backs off across its own retries,
+  so counting every attempt would let one transient registry blip burn five retries
+  in eight minutes and push a perfectly healthy image onto a multi-hour cadence. The
+  streak advances only when a job is *exhausted*.
+- **It backs off rather than disabling.** Auto-disabling after N failures is the
+  obvious move and it is wrong: tags that do not exist today exist tomorrow, and
+  recovery should not require a human with a SQL prompt. Backoff keeps the system
+  self-healing — measured on a broken image at a 10-second interval, successive
+  attempts fell 31s, 50s, 91s apart, and the moment the reference resolved the streak
+  went straight back to zero on its own.
+
+`consecutive_failures` is reported on `GET /api/images`, so a rotting entry is
+visible rather than merely cheap.
+
 ### Time-sensitive reorders work; it never skips safety gates
 
 A time-sensitive job jumps the priority lane and ignores "not due yet". It still
@@ -465,6 +501,7 @@ Every setting is a `SCANNER_`-prefixed environment variable (see `app/config.py`
 | `SCANNER_TRIVY_SERVER_URL` | set in compose | Enables client mode. **Required for more than one worker** — see the contention measurement above. |
 | `SCANNER_LEASE_SECONDS` | `1200` | After this a claimed job is presumed dead and reclaimed. Must exceed the scan timeout, or a slow scan loses its lease mid-flight and gets duplicated onto another worker — enforced at startup. |
 | `SCANNER_MAX_ATTEMPTS` | `5` | Retries before a job is marked failed. A nonexistent image fails immediately. A registry throttling us does not count as an attempt at all. |
+| `SCANNER_MAX_FAILURE_BACKOFF_SECONDS` | `86400` | Ceiling on the per-image backoff after repeated failures. A dead reference settles at one attempt a day and still recovers on its own. |
 | `SCANNER_PAGE_SIZE_DEFAULT` / `_MAX` | `100` / `1000` | Pagination. |
 
 ### Adding or retuning images
@@ -485,21 +522,24 @@ immediately — it is enqueued on that tick rather than after a delay.
 ```bash
 pip install -r requirements-dev.txt
 
-pytest                                  # 149 with Postgres; 70 pass/79 skip without
+pytest                                  # 164 with Postgres; 79 pass/85 skip without
 ruff check app tests scripts            # lint
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 ```
 
-Runs without Docker: 70 tests pass and the 79 database-backed ones skip cleanly.
-With Postgres reachable, all 149 run:
+Runs without Docker: 79 tests pass and the 85 database-backed ones skip cleanly.
+With Postgres reachable, all 164 run:
 
 ```bash
 docker compose up -d postgres
-SCANNER_POSTGRES_HOST=localhost pytest      # 149 passed
+SCANNER_POSTGRES_HOST=localhost pytest      # 164 passed
 ```
 
-The database-backed tests create their own `scanner_test` database rather than
-sharing one with a running stack — `queue.claim` takes the globally next due job, so
+The database-backed tests rebuild their own `scanner_test` database from the models
+on every session — `create_all` adds missing tables but never missing columns, so
+migrating it in place would turn a new column into a wall of `UndefinedColumn` errors
+for anyone who had run the suite before. It is a separate database rather than the
+running stack's — `queue.claim` takes the globally next due job, so
 sharing would have the tests and the live system stealing each other's work.
 
 ### Verifying against the brief
@@ -527,9 +567,9 @@ means the stated requirements are demonstrably met.
   every decision Trivy output can force is exercised here: severity variance across
   distros, missing and empty `FixedVersion`, `Results: null`, the zero timestamp
   meaning "unknown", duplicate CVEs at the same package grain, and malformed output.
-- **`test_scheduling.py`** covers due-time arithmetic, the skip invariant — including
-  the case a time-based heuristic gets wrong (fresh vulnerability DB, unchanged
-  image) — and the lease/timeout configuration guard.
+- **`test_scheduling.py`** covers due-time arithmetic, the per-image failure backoff
+  and its ceiling, the skip invariant — including the case a time-based heuristic gets
+  wrong (fresh vulnerability DB, unchanged image) — and the lease/timeout guard.
 - **`test_registry.py`** drives the registry client over `httpx.MockTransport`, so it
   runs offline: reference parsing, the bearer-token challenge, and the throttling path
   that replaced the token bucket — `429` on both the manifest *and* the token

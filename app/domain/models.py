@@ -76,6 +76,10 @@ class Image(Base):
     #: The run whose findings are live. Deliberately NOT advanced by a skipped run:
     #: a skip means the previous run findings are still exactly right.
     current_scan_run_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    #: Consecutive *jobs* that ended exhausted, reset by any success or skip. Drives
+    #: the per-image backoff in scheduler.next_due_at, and makes a rotting entry
+    #: visible on GET /api/images rather than merely cheap.
+    consecutive_failures: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     #: Denormalised from the most recent completed run of any kind, so that
     #: GET /api/images does not need a lateral join.
     last_scan_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)

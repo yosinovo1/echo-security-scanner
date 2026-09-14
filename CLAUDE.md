@@ -58,7 +58,7 @@ admin shell).
 ### Verify — run all four before calling anything done
 
 ```bash
-pytest                                  # 149 with Postgres; 70 pass/79 skip without
+pytest                                  # 164 with Postgres; 79 pass/85 skip without
 ruff check app tests scripts            # must be clean
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 python scripts/verify_requirements.py --wait 900 --with-db   # e2e vs. the brief
@@ -221,6 +221,12 @@ A change is done when all of these hold:
   documented schema, not captured from a live run. Re-capture with
   `trivy image --format json nginx:1.19` before trusting them as a regression
   baseline.
+- **Retry backoff exists at two levels and they count different things.**
+  `queue.fail` counts *attempts* within one job; `image.consecutive_failures` counts
+  *exhausted jobs*. Advancing the image streak per attempt would let one transient
+  blip push a healthy image onto a multi-hour cadence. Any success or skip clears it.
+  Without the image-level half, a deleted tag is re-enqueued forever — the job dies
+  instantly and the scheduler starts a fresh one an interval later.
 - **`queue.defer` deliberately does not increment `attempts`.** Registry backpressure
   is not failure and must not burn a job's retry allowance — otherwise a throttled
   registry walks every image to permanently failed. `RateLimited` and
