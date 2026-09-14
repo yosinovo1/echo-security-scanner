@@ -1,0 +1,27 @@
+# Trivy comes from its own published image at a pinned version rather than from an
+# install script, so the build is reproducible and needs no network trust decisions.
+FROM aquasec/trivy:0.58.1 AS trivy
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Trivy scans the registry directly (--image-src remote), so there is no Docker
+# socket to mount and no local daemon to depend on.
+COPY --from=trivy /usr/local/bin/trivy /usr/local/bin/trivy
+
+WORKDIR /srv
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY alembic.ini ./
+COPY app ./app
+
+RUN useradd --create-home --uid 10001 scanner \
+    && mkdir -p /trivy-cache \
+    && chown scanner:scanner /trivy-cache
+USER scanner
+
+CMD ["python", "-m", "app.scanner.worker"]

@@ -1,0 +1,141 @@
+name: echo-security-scanner
+
+x-db-env: &db-env
+  SCANNER_POSTGRES_HOST: postgres
+  SCANNER_POSTGRES_PORT: "5432"
+  SCANNER_POSTGRES_USER: scanner
+  SCANNER_POSTGRES_PASSWORD: scanner
+  SCANNER_POSTGRES_DB: scanner
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: scanner
+      POSTGRES_PASSWORD: scanner
+      POSTGRES_DB: scanner
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scanner -d scanner"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: schema, then the brief's ten images. Everything else waits on it.
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment: *db-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head && python -m app.db.seed"
+    restart: "no"
+
+  # Owns the vulnerability database. Workers scan through it as thin clients and
+  # never open the database file themselves.
+  #
+  # This is not just about avoiding a duplicate download. The database is a single
+  # ~1.3GB bbolt file, and two workers opening it concurrently serialise badly:
+  # measured on this stack, an image that scans in 6s uncontended took 116s with two
+  # workers sharing one cache directory. Client/server is what makes "scale = replica
+  # count" actually true.
+  #
+  # The chmod is so workers (uid 10001) can read db/metadata.json for the database
+  # version that feeds the skip invariant; read-only is enough, since they never open
+  # the database itself.
+  trivy-server:
+    image: aquasec/trivy:0.58.1
+    volumes:
+      - trivy-cache:/trivy-cache
+    ports:
+      - "4954:4954"
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "trivy image --cache-dir /trivy-cache --download-db-only &&
+       chmod -R a+rX /trivy-cache &&
+       exec trivy server --listen 0.0.0.0:4954 --cache-dir /trivy-cache"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:4954/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment: *db-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200
+          else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      <<: *db-env
+      SCANNER_DEFAULT_SCAN_INTERVAL_SECONDS: "900"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: ["python", "-m", "app.scheduler.scheduler"]
+    # Safe to raise: extra replicas fail the advisory lock and stand by.
+    deploy:
+      replicas: 1
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    environment:
+      <<: *db-env
+      # Writable and container-local, NOT a shared volume: Trivy keeps a per-scan
+      # artifact cache here, it is a bolt database too, and sharing it between
+      # workers would recreate the contention client mode exists to avoid. Being
+      # ephemeral only costs a cold layer pull when a worker restarts.
+      SCANNER_TRIVY_CACHE_DIR: /trivy-cache
+      SCANNER_TRIVY_DB_DIR: /trivy-db
+      SCANNER_TRIVY_SERVER_URL: http://trivy-server:4954
+    volumes:
+      # Read-only, and only for db/metadata.json: the database version feeds the
+      # skip invariant. Scanning itself goes through trivy-server.
+      - trivy-cache:/trivy-db:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      trivy-server:
+        condition: service_healthy
+    # One scan per process: concurrency is replica count. Raise with
+    # `docker compose up --scale worker=N`.
+    deploy:
+      replicas: 2
+
+volumes:
+  pgdata:
+  trivy-cache:
