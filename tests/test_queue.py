@@ -161,13 +161,19 @@ class TestFailureHandling:
 
 
 class TestLeaseReaping:
-    def test_expired_lease_returns_the_job_to_the_queue(self, session, image):
-        queue.enqueue(session, image.id)
+    @staticmethod
+    def _strand(session, image, *, max_attempts=5):
+        """Claim a job and let its worker die without reporting."""
         job = queue.claim(session, lease_seconds=600)
         job.lease_until = now() - timedelta(seconds=1)
         session.flush()
+        return job, queue.reap_expired_leases(session, max_attempts=max_attempts)
 
-        assert queue.reap_expired_leases(session) == 1
+    def test_expired_lease_returns_the_job_to_the_queue(self, session, image):
+        queue.enqueue(session, image.id)
+        job, reaped = self._strand(session, image)
+
+        assert len(reaped) == 1
         session.refresh(job)
         assert job.status == JobStatus.PENDING
         assert job.attempts == 1
@@ -176,4 +182,40 @@ class TestLeaseReaping:
     def test_live_lease_is_left_alone(self, session, image):
         queue.enqueue(session, image.id)
         queue.claim(session, lease_seconds=600)
-        assert queue.reap_expired_leases(session) == 0
+        assert queue.reap_expired_leases(session, max_attempts=5) == []
+
+    def test_a_reaped_attempt_counts_against_the_allowance(self, session, image):
+        """The bug this closes: a scan that kills its worker never reaches ``fail``.
+
+        Without this the job is re-claimed forever, taking down one more worker each
+        time, while the image's failure streak stays at zero because no *job* ever
+        exhausts -- so the per-image backoff never engages either.
+        """
+        queue.enqueue(session, image.id)
+        for attempt in range(1, 3):
+            job, reaped = self._strand(session, image, max_attempts=3)
+            assert reaped[0].exhausted is False
+            session.refresh(job)
+            assert (job.status, job.attempts) == (JobStatus.PENDING, attempt)
+
+        job, reaped = self._strand(session, image, max_attempts=3)
+        assert reaped[0].exhausted is True
+        session.refresh(job)
+        assert job.status == JobStatus.FAILED
+        assert queue.claim(session, lease_seconds=600) is None
+
+    def test_an_exhausted_reap_names_the_image_so_the_streak_can_advance(
+        self, session, image
+    ):
+        queue.enqueue(session, image.id)
+        _, reaped = self._strand(session, image, max_attempts=1)
+        assert reaped[0].image_id == image.id
+        assert reaped[0].exhausted is True
+
+    def test_a_permanently_failed_reap_frees_the_image_for_rescheduling(
+        self, session, image
+    ):
+        queue.enqueue(session, image.id)
+        self._strand(session, image, max_attempts=1)
+        # The partial unique index is released, so the image is not wedged forever.
+        assert queue.enqueue(session, image.id) is True

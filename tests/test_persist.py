@@ -15,7 +15,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.domain.models import Cve, Finding, Image, Package, RunStatus, ScanRun
 from app.domain.severity import Severity
@@ -361,6 +361,38 @@ class TestCveDescriptions:
         assert row.description == "the real detail"
         assert row.title == "a title"
 
+    def test_fields_arrive_independently_across_scans(self, session, image):
+        """The case that keeps the COALESCE honest once the write guard exists.
+
+        The guard fires when *any* descriptive field is fillable, but the SET touches
+        all four -- so a scan that supplies only the description would blank a title
+        an earlier scan had already learned. Different distributions genuinely report
+        different subsets of these fields for the same CVE, so this is the ordinary
+        case, not a contrived one.
+        """
+        cve = cve_id()
+        persist.record_success(
+            session,
+            image,
+            None,
+            report(finding(cve, title="known title", description=None)),
+            meta(),
+        )
+        persist.record_success(
+            session,
+            image,
+            None,
+            report(
+                finding(cve, title=None, description="learned later"),
+                digest="sha256:bbb",
+            ),
+            meta("sha256:bbb"),
+        )
+
+        row = session.execute(select(Cve).where(Cve.id == cve)).scalar_one()
+        assert row.title == "known title"
+        assert row.description == "learned later"
+
     def test_the_same_cve_from_two_packages_is_stored_once(self, session, image):
         cve = cve_id()
         persist.record_success(
@@ -376,3 +408,177 @@ class TestCveDescriptions:
         rows = session.execute(select(Cve).where(Cve.id == cve)).scalars().all()
         assert len(rows) == 1
         assert len(current_findings(session, image)) == 2
+
+
+class TestAffectedImageCount:
+    """``cve.affected_image_count`` decides whether a CVE appears in GET /api/cves.
+
+    It replaces an EXISTS over the finding table, so if it drifts high the API lists
+    a CVE nothing carries any more, and if it drifts low a live vulnerability
+    disappears from the listing. The second is the one that matters.
+    """
+
+    def count(self, session, cve: str) -> int:
+        return session.execute(
+            select(Cve.affected_image_count).where(Cve.id == cve)
+        ).scalar_one()
+
+    def test_counts_the_images_currently_reporting_it(self, session, image, other_image):
+        shared = cve_id()
+        persist.record_success(session, image, None, report(finding(shared)), meta())
+        assert self.count(session, shared) == 1
+
+        persist.record_success(session, other_image, None, report(finding(shared)), meta())
+        assert self.count(session, shared) == 2
+
+    def test_the_same_cve_from_two_packages_in_one_image_counts_once(self, session, image):
+        cve = cve_id()
+        persist.record_success(
+            session,
+            image,
+            None,
+            report(
+                finding(cve, package="libssl", version="1.0"),
+                finding(cve, package="libcrypto", version="1.0"),
+            ),
+            meta(),
+        )
+        # It counts *images*, not findings -- one image with two vulnerable packages
+        # is still one affected image.
+        assert self.count(session, cve) == 1
+
+    def test_it_drops_when_an_image_stops_reporting_the_cve(
+        self, session, image, other_image
+    ):
+        shared, replacement = cve_id(), cve_id()
+        persist.record_success(session, image, None, report(finding(shared)), meta())
+        persist.record_success(session, other_image, None, report(finding(shared)), meta())
+
+        persist.record_success(
+            session, image, None, report(finding(replacement), digest="sha256:bbb"), meta("sha256:bbb")
+        )
+        assert self.count(session, shared) == 1
+
+    def test_it_reaches_zero_so_the_cve_leaves_the_listing(self, session, image):
+        cve = cve_id()
+        persist.record_success(session, image, None, report(finding(cve)), meta())
+        persist.record_success(
+            session, image, None, report(digest="sha256:bbb"), meta("sha256:bbb")
+        )
+        assert self.count(session, cve) == 0
+
+    def test_a_skip_does_not_disturb_it(self, session, image):
+        cve = cve_id()
+        persist.record_success(session, image, None, report(finding(cve)), meta())
+        persist.record_skip(session, image, None, meta(), reason="unchanged")
+        # A skip leaves current_scan_run_id alone, so the findings -- and the count
+        # derived from them -- are still exactly right.
+        assert self.count(session, cve) == 1
+
+
+class TestDenormalisedCounts:
+    """The counts on ``scan_run`` must never disagree with the findings they describe.
+
+    They exist so ``GET /api/images`` does not aggregate the finding table, which is
+    the one denormalisation in the schema that could silently understate how
+    vulnerable an image is. Written in the same transaction as the findings, so the
+    only way they drift is a code change -- which is what this class is here to fail.
+    """
+
+    def _counts(self, run: ScanRun) -> dict[Severity, int]:
+        return {
+            severity: getattr(run, f"finding_count_{severity.value.lower()}")
+            for severity in Severity
+        }
+
+    def test_counts_match_the_findings_the_run_made_current(self, session, image):
+        run = persist.record_success(
+            session,
+            image,
+            None,
+            report(
+                finding(cve_id(), Severity.CRITICAL),
+                finding(cve_id(), Severity.HIGH, package="zlib"),
+                finding(cve_id(), Severity.HIGH, package="curl"),
+                finding(cve_id(), Severity.LOW, package="bash"),
+            ),
+            meta(),
+        )
+        counted = self._counts(run)
+        assert counted[Severity.CRITICAL] == 1
+        assert counted[Severity.HIGH] == 2
+        assert counted[Severity.LOW] == 1
+        assert sum(counted.values()) == len(current_findings(session, image))
+
+    def test_a_clean_image_counts_zero_rather_than_null(self, session, image):
+        run = persist.record_success(session, image, None, report(), meta())
+        assert self._counts(run) == dict.fromkeys(Severity, 0)
+
+    def test_counts_follow_a_rescan_downwards(self, session, image):
+        first = cve_id()
+        persist.record_success(
+            session, image, None, report(finding(first, Severity.CRITICAL)), meta()
+        )
+        second = persist.record_success(
+            session, image, None, report(finding(first, Severity.LOW)), meta()
+        )
+        assert second.finding_count_critical == 0
+        assert second.finding_count_low == 1
+
+    @pytest.mark.parametrize("recorder", ["failure", "skip"])
+    def test_a_run_that_produced_no_findings_has_no_counts_at_all(
+        self, session, image, recorder
+    ):
+        # NULL, not 0: neither outcome produced a finding set, and a security tool
+        # must never render "we do not know" as "zero vulnerabilities".
+        if recorder == "failure":
+            run = persist.record_failure(session, image, None, meta(None), error="boom")
+        else:
+            run = persist.record_skip(session, image, None, meta(), reason="unchanged")
+        assert self._counts(run) == dict.fromkeys(Severity, None)
+
+
+class TestRollupWriteAmplification:
+    def test_an_unchanged_rollup_does_not_rewrite_the_row(self, session, image):
+        """Every successful scan recomputes the rollup for every CVE in the image.
+
+        Almost none have changed rank, so without the IS DISTINCT FROM guard a single
+        scan rewrites thousands of rows to the values they already held -- dead row
+        versions and WAL for no change, and a wider window for two workers to collide
+        on images that share CVEs. ``ctid`` is the row's physical location and
+        moves on any update, including one inside the transaction that wrote it --
+        which ``xmin`` would not show, since it is per transaction, not per write.
+        """
+        cve = cve_id()
+        persist.record_success(session, image, None, report(finding(cve, Severity.HIGH)), meta())
+        session.flush()
+        before = session.execute(
+            select(text("ctid::text")).select_from(Cve).where(Cve.id == cve)
+        ).scalar_one()
+
+        persist.record_success(session, image, None, report(finding(cve, Severity.HIGH)), meta())
+        session.flush()
+        after = session.execute(
+            select(text("ctid::text")).select_from(Cve).where(Cve.id == cve)
+        ).scalar_one()
+
+        assert after == before
+
+    def test_but_a_changed_rollup_is_written(self, session, image):
+        cve = cve_id()
+        persist.record_success(session, image, None, report(finding(cve, Severity.LOW)), meta())
+        session.flush()
+        before = session.execute(
+            select(text("ctid::text")).select_from(Cve).where(Cve.id == cve)
+        ).scalar_one()
+
+        persist.record_success(
+            session, image, None, report(finding(cve, Severity.CRITICAL)), meta()
+        )
+        session.flush()
+        after = session.execute(
+            select(text("ctid::text")).select_from(Cve).where(Cve.id == cve)
+        ).scalar_one()
+
+        assert after != before
+        assert rollup(session, cve) == Severity.CRITICAL

@@ -69,31 +69,35 @@ async def list_images(
     }
 
     if summaries:
-        image_ids = list(summaries)
-
-        # Only findings from each image's current run are counted; a finding that
-        # stopped appearing is history, not a live vulnerability.
-        counts = await session.execute(
-            select(Finding.image_id, Finding.severity, func.count())
-            .join(Image, Image.id == Finding.image_id)
-            .where(
-                Finding.image_id.in_(image_ids),
-                Finding.last_seen_run_id == Image.current_scan_run_id,
+        # Digest and severity counts both come off each image's current run, which is
+        # by definition its last *successful* one -- a skip never repoints it. The
+        # counts are read rather than aggregated: recomputing them would mean summing
+        # the finding table for every image on every request, which is ~200k rows per
+        # page at a thousand images, to rederive a number the scan already knew.
+        runs = await session.execute(
+            select(
+                ScanRun.image_id,
+                ScanRun.digest,
+                ScanRun.finding_count_critical,
+                ScanRun.finding_count_high,
+                ScanRun.finding_count_medium,
+                ScanRun.finding_count_low,
+                ScanRun.finding_count_unknown,
             )
-            .group_by(Finding.image_id, Finding.severity)
-        )
-        for image_id, severity, count in counts:
-            summary = summaries[image_id]
-            setattr(summary.severity_counts, Severity(severity).value, count)
-            summary.total_cves += count
-
-        digests = await session.execute(
-            select(ScanRun.image_id, ScanRun.digest)
             .join(Image, Image.current_scan_run_id == ScanRun.id)
-            .where(ScanRun.image_id.in_(image_ids))
+            .where(ScanRun.image_id.in_(list(summaries)))
         )
-        for image_id, digest in digests:
-            summaries[image_id].digest = digest
+        for image_id, digest, *counts in runs:
+            summary = summaries[image_id]
+            summary.digest = digest
+            summary.severity_counts = SeverityCounts(
+                CRITICAL=counts[0] or 0,
+                HIGH=counts[1] or 0,
+                MEDIUM=counts[2] or 0,
+                LOW=counts[3] or 0,
+                UNKNOWN=counts[4] or 0,
+            )
+            summary.total_cves = summary.severity_counts.total
 
     return Page[ImageSummary](
         items=list(summaries.values()),

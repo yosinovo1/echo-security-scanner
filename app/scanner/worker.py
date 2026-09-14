@@ -206,8 +206,11 @@ def _record_failure(
 
 
 def run_once(session: Session, settings: Settings) -> bool:
-    """Process at most one job. Returns True if a job was claimed."""
-    queue.reap_expired_leases(session)
+    """Process at most one job. Returns True if a job was claimed.
+
+    Expired leases are the scheduler's business, not a worker's; a worker only
+    claims and executes.
+    """
     job = queue.claim(session, lease_seconds=settings.lease_seconds)
     session.commit()
 

@@ -18,6 +18,7 @@ from app.config import Settings, get_settings
 from app.db.session import sync_session
 from app.domain.models import Image, JobStatus, ScanJob
 from app.jobs import queue
+from app.scanner import persist
 
 log = logging.getLogger("scheduler")
 
@@ -84,9 +85,52 @@ def due_images(session: Session, settings: Settings) -> list[Image]:
     ]
 
 
+def record_reaped(session: Session, reaped: list[queue.ReapedJob]) -> None:
+    """Write a scan_run for every attempt whose worker died mid-scan.
+
+    A dead worker is the one failure nobody is left alive to report, so without this
+    it is the one failure that leaves no row -- invisible in the history that
+    ``scan_run`` exists to be. Routed through ``persist.record_failure`` rather than
+    written here so that "how a failed attempt is recorded" keeps a single
+    definition, including advancing the image's failure streak when the job gave up.
+    """
+    for entry in reaped:
+        image = session.get(Image, entry.image_id)
+        if image is None:  # pragma: no cover - FK makes this unreachable in practice
+            continue
+        now = _now()
+        persist.record_failure(
+            session,
+            image,
+            session.get(ScanJob, entry.job_id),
+            persist.RunMetadata(
+                digest=None,
+                trivy_version=None,
+                trivy_db_version=None,
+                scan_flags_hash=None,
+                started_at=now,
+                completed_at=now,
+            ),
+            error=queue.LEASE_EXPIRED_ERROR,
+            exhausted=entry.exhausted,
+        )
+        log.warning(
+            "reaped job %s on %s (exhausted=%s)",
+            entry.job_id, image.reference, entry.exhausted,
+        )
+
+
 def tick(session: Session, settings: Settings) -> int:
-    """One scheduling pass. Returns the number of jobs enqueued."""
-    queue.reap_expired_leases(session)
+    """One scheduling pass. Returns the number of jobs enqueued.
+
+    Reaping lives here rather than in the worker because it is administration of a
+    job this process does not own: it decides another worker is dead, and it writes
+    that worker's failure bookkeeping. That is exactly the cross-cutting housekeeping
+    the advisory-locked singleton exists to hold, and keeping it out of the workers
+    stops N of them racing on the same UPDATE every poll.
+    """
+    reaped = queue.reap_expired_leases(session, max_attempts=settings.max_attempts)
+    record_reaped(session, reaped)
 
     enqueued = 0
     for image in due_images(session, settings):

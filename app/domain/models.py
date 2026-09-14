@@ -177,8 +177,36 @@ class ScanRun(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    #: What this run found, by severity, denormalised so that GET /api/images does
+    #: not aggregate the finding table. It is a fact *about this run*, immutable once
+    #: written, and it commits in the same transaction as the findings it counts --
+    #: so unlike a cache there is no window in which it can disagree with them.
+    #:
+    #: NULL rather than 0 on a failed or skipped run: those produce no finding set of
+    #: their own, and a security tool must never render "we do not know" as "zero
+    #: vulnerabilities". Only a successful run is ever read, because
+    #: ``image.current_scan_run_id`` only ever points at one.
+    finding_count_critical: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finding_count_high: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finding_count_medium: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finding_count_low: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finding_count_unknown: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     __table_args__ = (
         Index("ix_scan_run_image_completed", "image_id", text("completed_at DESC")),
+        #: Serves the API freshness validator, which runs MAX(completed_at) over the
+        #: whole table on every collection request. Leading with image_id above makes
+        #: that index useless for it, so an unindexed scan of a table that only grows
+        #: was being paid per request: measured 129ms at a 1000-image fleet's first
+        #: month, 0.6ms with this.
+        Index("ix_scan_run_completed", text("completed_at DESC")),
+        #: /health asks the narrower question -- the newest run that actually
+        #: produced findings.
+        Index(
+            "ix_scan_run_last_success",
+            text("completed_at DESC"),
+            postgresql_where=text("status = 'success'"),
+        ),
     )
 
 
@@ -208,10 +236,29 @@ class Cve(Base):
     )
     max_severity_rank: Mapped[int] = mapped_column(SmallInteger, server_default=text("0"))
 
+    #: How many scanned images currently carry this CVE. Derived alongside
+    #: ``max_severity`` in the same recompute, so it costs nothing extra to maintain
+    #: and it is what makes "is this CVE live?" an indexed predicate instead of an
+    #: EXISTS over the whole finding table. Zero means every image that used to
+    #: report it has stopped, so it drops out of GET /api/cves.
+    affected_image_count: Mapped[int] = mapped_column(
+        Integer, server_default=text("0")
+    )
+
     published_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
     last_modified_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
 
-    __table_args__ = (Index("ix_cve_max_severity_rank", "max_severity_rank"),)
+    __table_args__ = (
+        Index("ix_cve_max_severity_rank", "max_severity_rank"),
+        # GET /api/cves in its exact shape: live CVEs, worst first. Partial, so the
+        # index holds only the CVEs any endpoint can return.
+        Index(
+            "ix_cve_live_by_severity",
+            text("max_severity_rank DESC"),
+            "id",
+            postgresql_where=text("affected_image_count > 0"),
+        ),
+    )
 
 
 class Finding(Base):

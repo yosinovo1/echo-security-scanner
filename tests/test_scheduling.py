@@ -1,7 +1,8 @@
-"""Pure-logic tests: due-time arithmetic, the skip invariant, and lease configuration.
+"""Scheduler behaviour: due-time arithmetic, the skip invariant, lease configuration.
 
-These need no database and no network, so they run everywhere. Registry reference
-parsing lives in ``test_registry.py`` alongside the rest of the registry client.
+Most of this is pure logic needing no database and no network, so it runs everywhere.
+The exception is ``TestReapingDeadWorkers`` at the end, which needs real rows.
+Registry reference parsing lives in ``test_registry.py`` with the rest of the client.
 """
 from __future__ import annotations
 
@@ -11,9 +12,10 @@ import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.domain.models import Image, RunStatus, ScanRun
+from app.domain.models import Image, JobStatus, RunStatus, ScanJob, ScanRun
+from app.jobs import queue
 from app.scanner.worker import _is_unchanged
-from app.scheduler.scheduler import next_due_at
+from app.scheduler.scheduler import next_due_at, tick
 
 #: The default failure-backoff ceiling, spelled out so the arithmetic below reads.
 DAY = 86400
@@ -154,3 +156,77 @@ class TestLeaseConfiguration:
     def test_a_lease_shorter_than_the_scan_timeout_is_rejected(self):
         with pytest.raises(ValidationError, match="must exceed"):
             Settings(lease_seconds=300, trivy_timeout_seconds=900)
+
+
+class TestReapingDeadWorkers:
+    """What happens to a job whose worker stopped reporting.
+
+    A worker killed mid-scan -- OOM on a large image, a Trivy crash, an evicted node
+    -- never reaches its own error handling, so the scheduler is the only process
+    left to account for the attempt. If it does not, that attempt is the one failure
+    in the system that leaves no trace and costs nothing, which is exactly the
+    combination that lets a job retry forever.
+    """
+
+    pytestmark = pytest.mark.postgres
+
+    @pytest.fixture
+    def settings(self) -> Settings:
+        return Settings()
+
+    def _strand(self, session, image, settings):
+        """Claim a job, then let its lease lapse without the worker reporting."""
+        queue.enqueue(session, image.id)
+        job = queue.claim(session, lease_seconds=600)
+        job.lease_until = datetime.now(UTC) - timedelta(seconds=1)
+        session.flush()
+        tick(session, settings)
+        return session.query(ScanJob).filter(ScanJob.image_id == image.id).one()
+
+    def _runs(self, session, image):
+        return session.query(ScanRun).filter(ScanRun.image_id == image.id).all()
+
+    def test_a_dead_attempt_is_recorded_as_a_failed_run(self, session, image, settings):
+        self._strand(session, image, settings)
+
+        runs = self._runs(session, image)
+        assert len(runs) == 1
+        assert runs[0].status == RunStatus.FAILED
+        assert "lease expired" in runs[0].error
+
+    def test_the_image_reflects_that_its_scan_died(self, session, image, settings):
+        self._strand(session, image, settings)
+
+        session.refresh(image)
+        assert image.last_scan_status == RunStatus.FAILED
+        assert image.last_scan_at is not None
+
+    def test_a_reap_with_attempts_left_does_not_advance_the_failure_streak(
+        self, session, image, settings
+    ):
+        job = self._strand(session, image, settings)
+
+        assert job.status == JobStatus.PENDING
+        session.refresh(image)
+        # The streak counts exhausted jobs, not attempts -- same rule as a worker
+        # that lived long enough to report the failure itself.
+        assert image.consecutive_failures == 0
+
+    def test_a_reap_that_exhausts_the_job_does(self, session, image, settings):
+        settings = Settings(max_attempts=1)
+        job = self._strand(session, image, settings)
+
+        assert job.status == JobStatus.FAILED
+        session.refresh(image)
+        assert image.consecutive_failures == 1
+
+    def test_a_live_lease_is_not_disturbed(self, session, image, settings):
+        queue.enqueue(session, image.id)
+        queue.claim(session, lease_seconds=600)
+        session.flush()
+
+        tick(session, settings)
+
+        assert self._runs(session, image) == []
+        session.refresh(image)
+        assert image.last_scan_status is None

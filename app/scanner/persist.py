@@ -5,15 +5,16 @@ change, so a scan's findings and its completion are committed or lost together.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import String, bindparam, func, select, text, tuple_
+from sqlalchemy import String, and_, bindparam, func, or_, select, text, tuple_
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 from sqlalchemy.orm import Session
 
 from app.domain.models import Cve, Finding, Image, Package, RunStatus, ScanJob, ScanRun
-from app.domain.severity import SEVERITY_RANK, rank
+from app.domain.severity import SEVERITY_RANK, Severity, rank
 from app.scanner.parser import ParsedReport
 
 # Rank -> name, so the rollup can be a single UPDATE instead of a read/modify/write.
@@ -111,22 +112,33 @@ def _upsert_cves(session: Session, report: ParsedReport) -> None:
         return
 
     statement = insert(Cve).values(list(by_id.values()))
+    descriptive = ("title", "description", "published_at", "last_modified_at")
     session.execute(
         statement.on_conflict_do_update(
             index_elements=[Cve.id],
             # COALESCE so a later scan that omits a description does not erase one.
             set_={
-                "title": func.coalesce(statement.excluded.title, Cve.title),
-                "description": func.coalesce(
-                    statement.excluded.description, Cve.description
-                ),
-                "published_at": func.coalesce(
-                    statement.excluded.published_at, Cve.published_at
-                ),
-                "last_modified_at": func.coalesce(
-                    statement.excluded.last_modified_at, Cve.last_modified_at
-                ),
+                field: func.coalesce(
+                    getattr(statement.excluded, field), getattr(Cve, field)
+                )
+                for field in descriptive
             },
+            # Given that COALESCE, the row only changes when this scan fills in a
+            # field we were missing -- so write only then. Every CVE in the image
+            # reaches here on every successful scan, and a CVE's description does not
+            # change between two scans fifteen minutes apart: without this, a rescan
+            # rewrites thousands of rows to the values they already held. Same
+            # argument as the rollup below, and both are needed, since either one
+            # alone still rewrites the row.
+            where=or_(
+                *(
+                    and_(
+                        getattr(Cve, field).is_(None),
+                        getattr(statement.excluded, field).is_not(None),
+                    )
+                    for field in descriptive
+                )
+            ),
         )
     )
 
@@ -137,7 +149,13 @@ def _upsert_findings(
     report: ParsedReport,
     package_ids: dict[tuple[str, str, str], int],
     run_id: int,
-) -> None:
+) -> dict[Severity, int]:
+    """Write the findings and return what was written, counted by severity.
+
+    Counted from the rows actually inserted rather than from ``report.findings``, so
+    the denormalised totals on ``scan_run`` can never describe rows that did not
+    reach the table.
+    """
     rows = []
     for finding in report.findings:
         package_id = package_ids.get(
@@ -157,8 +175,9 @@ def _upsert_findings(
                 "last_seen_run_id": run_id,
             }
         )
+    counts = Counter(Severity(row["severity"]) for row in rows)
     if not rows:
-        return
+        return dict(counts)
 
     statement = insert(Finding).values(rows)
     session.execute(
@@ -174,13 +193,31 @@ def _upsert_findings(
             },
         )
     )
+    return dict(counts)
 
 
 def _recompute_cve_rollup(session: Session, cve_ids: set[str]) -> None:
     """Recompute ``cve.max_severity`` over *current* findings only.
 
+    Recomputes both derived columns on ``cve``: ``max_severity`` and
+    ``affected_image_count``. They come from the same GROUP BY over current findings,
+    so maintaining the second costs nothing over the first -- and it is what lets
+    ``GET /api/cves`` filter on an indexed column instead of running an EXISTS over
+    the whole finding table per CVE.
+
     Must run after ``image.current_scan_run_id`` has been advanced, since that column
     is what defines which findings count.
+
+    The ``IS DISTINCT FROM`` guard is load-bearing at scale, not a micro-optimisation.
+    Every successful scan reaches here with every CVE in the image -- roughly two
+    thousand of them -- and almost none have actually changed rank, so without it a
+    single scan rewrites two thousand rows to the values they already held.
+
+    Measured with eight concurrent scanners over 400 shared CVEs, six rounds each:
+    38,000 dead tuples and a 2.9 MB table against 400 live rows, versus 0 dead tuples
+    and 168 kB with the guard in place. It is table bloat and WAL for no change.
+    (It does *not* cause deadlocks -- that was worth checking, and neither variant
+    produced one; the cost is purely churn.)
     """
     if not cve_ids:
         return
@@ -189,10 +226,13 @@ def _recompute_cve_rollup(session: Session, cve_ids: set[str]) -> None:
         f"""
         UPDATE cve
            SET max_severity_rank = COALESCE(sub.rank, 0),
-               max_severity = CASE COALESCE(sub.rank, 0) {_RANK_CASE} ELSE 'UNKNOWN' END
+               max_severity = CASE COALESCE(sub.rank, 0) {_RANK_CASE} ELSE 'UNKNOWN' END,
+               affected_image_count = COALESCE(sub.images, 0)
           FROM unnest(:ids) AS ids(cve_id)
           LEFT JOIN (
-                SELECT f.cve_id, MAX(f.severity_rank) AS rank
+                SELECT f.cve_id,
+                       MAX(f.severity_rank) AS rank,
+                       COUNT(DISTINCT f.image_id) AS images
                   FROM finding f
                   JOIN image i ON i.id = f.image_id
                  WHERE f.last_seen_run_id = i.current_scan_run_id
@@ -200,6 +240,8 @@ def _recompute_cve_rollup(session: Session, cve_ids: set[str]) -> None:
                  GROUP BY f.cve_id
           ) sub ON sub.cve_id = ids.cve_id
          WHERE cve.id = ids.cve_id
+           AND (cve.max_severity_rank IS DISTINCT FROM COALESCE(sub.rank, 0)
+                OR cve.affected_image_count IS DISTINCT FROM COALESCE(sub.images, 0))
         """
     ).bindparams(bindparam("ids", value=sorted(cve_ids), type_=ARRAY(String)))
     session.execute(statement)
@@ -222,7 +264,10 @@ def record_success(
 
     package_ids = _upsert_packages(session, report)
     _upsert_cves(session, report)
-    _upsert_findings(session, image, report, package_ids, run.id)
+    counts = _upsert_findings(session, image, report, package_ids, run.id)
+
+    for severity in Severity:
+        setattr(run, f"finding_count_{severity.value.lower()}", counts.get(severity, 0))
 
     image.current_scan_run_id = run.id
     image.last_scan_at = meta.completed_at

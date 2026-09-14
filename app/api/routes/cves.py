@@ -29,32 +29,16 @@ async def list_cves(
     if not_modified:
         return Response(status_code=304, headers=dict(response.headers))
 
-    live = (
-        select(Finding.cve_id)
-        .join(Image, Image.id == Finding.image_id)
-        .where(
-            Finding.last_seen_run_id == Image.current_scan_run_id,
-            Finding.cve_id == Cve.id,
-        )
-        .exists()
-    )
-
-    conditions = [live]
+    # "Currently found in at least one image". Maintained by the same recompute as
+    # max_severity, so this is an indexed column rather than an EXISTS over the whole
+    # finding table -- which at a thousand images meant hashing two million rows to
+    # answer a question the last scan already settled.
+    conditions = [Cve.affected_image_count > 0]
     if severity is not None:
         # Filters on the rollup, not on any single image's vendor rating.
         conditions.append(Cve.max_severity_rank == rank(severity))
 
     total = await session.scalar(select(func.count()).select_from(Cve).where(*conditions)) or 0
-
-    affected_count = (
-        select(func.count(func.distinct(Finding.image_id)))
-        .join(Image, Image.id == Finding.image_id)
-        .where(
-            Finding.cve_id == Cve.id,
-            Finding.last_seen_run_id == Image.current_scan_run_id,
-        )
-        .scalar_subquery()
-    )
 
     rows = await session.execute(
         select(
@@ -63,7 +47,7 @@ async def list_cves(
             Cve.max_severity,
             Cve.published_at,
             Cve.last_modified_at,
-            affected_count,
+            Cve.affected_image_count,
         )
         .where(*conditions)
         .order_by(Cve.max_severity_rank.desc(), Cve.id)

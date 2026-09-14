@@ -58,7 +58,7 @@ admin shell).
 ### Verify — run all four before calling anything done
 
 ```bash
-pytest                                  # 164 with Postgres; 79 pass/85 skip without
+pytest                                  # 201 with Postgres; 79 pass/122 skip without
 ruff check app tests scripts            # must be clean
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 python scripts/verify_requirements.py --wait 900 --with-db   # e2e vs. the brief
@@ -75,7 +75,7 @@ exercises the failure path by registering an unresolvable image.
 ```bash
 pytest tests/test_parser.py -q                    # no DB needed
 pytest -m postgres                                # DB-backed only
-docker compose up -d postgres                     # unskips the 19 DB tests
+docker compose up -d postgres                     # unskips the DB-backed tests
 ruff check app tests scripts --fix
 uvicorn app.api.main:app --reload                 # API against an existing DB
 python -m app.scheduler.scheduler
@@ -105,7 +105,9 @@ Four processes over one PostgreSQL database.
   replicas idle rather than duplicate work, giving failover without leader election.
   Inserts due jobs; reaps expired leases.
 - **`app/scanner/worker.py`** — synchronous, **one scan per process**. A wedged Trivy
-  takes down one worker, not M in-flight scans. Scale = replica count.
+  takes down one worker, not M in-flight scans. Scale = replica count. It claims and
+  executes only; it does **not** reap leases — that is administration of jobs it does
+  not own, and belongs to the singleton.
 - **`app/jobs/queue.py`** — the queue *is* Postgres (`FOR UPDATE SKIP LOCKED`).
 - **`trivy-server`** (compose only) — owns the vulnerability database. Workers scan
   through it as thin clients and never open the database file themselves.
@@ -144,7 +146,7 @@ file, and two workers sharing one cache took **116s** to scan an image that take
 `SCANNER_TRIVY_SERVER_URL` and workers become thin clients. Do not go back to a
 shared cache with more than one worker.
 
-### Four invariants — breaking these corrupts results silently rather than raising
+### Five invariants — breaking these corrupts results silently rather than raising
 
 1. **A finding is "current" iff `finding.last_seen_run_id == image.current_scan_run_id`.**
    Every read path filters on this. Findings are never deleted — one that stops being
@@ -157,13 +159,23 @@ shared cache with more than one worker.
 3. **Severity lives on `finding`, not `cve`.** Distros rate the same CVE differently.
    `cve.max_severity` is a derived rollup (`persist._recompute_cve_rollup`) over
    *current* findings only — so it must run **after** `current_scan_run_id` is
-   updated.
+   updated. The same recompute maintains `cve.affected_image_count`; see invariant 5.
 
 4. **Scan skipping is a content invariant, not a timer**: digest + Trivy version +
    vuln DB version + flags hash all equal to the last successful run
    (`worker._is_unchanged`). Never replace this with elapsed-time logic — that is
    wrong in both directions: it skips scans a fresh vuln DB would light up, and runs
    scans that provably cannot differ.
+
+5. **Both list endpoints read rollups instead of aggregating `finding`, so the
+   rollups must not drift.** `scan_run.finding_count_*` (written in
+   `persist.record_success` from the rows actually inserted; `NULL`, never `0`, on a
+   failed or skipped run) backs `GET /api/images`. `cve.affected_image_count` (from
+   `persist._recompute_cve_rollup`, alongside `max_severity`) decides whether a CVE
+   appears in `GET /api/cves` at all — drift low and a live vulnerability vanishes
+   from the listing. Both commit in the same transaction as the findings they
+   describe. Tested in `test_persist.py::TestDenormalisedCounts` and
+   `::TestAffectedImageCount`.
 
 ## Conventions
 
@@ -221,7 +233,15 @@ A change is done when all of these hold:
   documented schema, not captured from a live run. Re-capture with
   `trivy image --format json nginx:1.19` before trusting them as a regression
   baseline.
-- **Retry backoff exists at two levels and they count different things.**
+- **Retry backoff exists at *three* levels.** `queue.fail` counts attempts within a
+  job; `image.consecutive_failures` counts exhausted jobs; and
+  `queue.reap_expired_leases` counts an attempt for a worker that died without
+  reporting. The third is easy to miss and was a real bug: a reap that does not
+  consult `max_attempts` makes a job that can never give up, so a scan that kills its
+  worker is re-claimed forever and neither of the other two levels ever engages. Reap
+  bookkeeping goes through `persist.record_failure` like any other failure — do not
+  write it inline, or "how a failed attempt is recorded" grows a second definition.
+- **Two levels of it count different things.**
   `queue.fail` counts *attempts* within one job; `image.consecutive_failures` counts
   *exhausted jobs*. Advancing the image streak per attempt would let one transient
   blip push a healthy image onto a multi-hour cadence. Any success or skip clears it.
@@ -259,11 +279,24 @@ A change is done when all of these hold:
   must not share one with a running stack: `queue.claim` takes the globally next due
   job, so they would claim the system's jobs and vice versa. Run them with
   `SCANNER_POSTGRES_HOST=localhost pytest`.
+- **Writes to `cve` are guarded twice, and both guards are needed.** `_upsert_cves`
+  has a `where=` on its `ON CONFLICT DO UPDATE`, and `_recompute_cve_rollup` has an
+  `IS DISTINCT FROM`. Every CVE in an image reaches both on every successful scan and
+  almost none have changed, so dropping either means a rescan rewrites thousands of
+  rows to the values they already hold (measured: 38,000 dead tuples against 400 live
+  rows, versus 0). The `COALESCE` in `_upsert_cves` is still
+  load-bearing alongside its guard: the guard fires when *any* descriptive field is
+  fillable, but the `SET` touches all four.
 - **Queue time comparisons use `statement_timestamp()`, not `now()`.** `now()` is
   frozen at transaction start, so a job enqueued mid-transaction looks not-yet-due.
 
 ## Known gaps
 
 Documented in `README.md` under "Known limitations" — untested subprocess boundary,
-hand-authored fixtures, offset pagination, anonymous-registry-only auth. If asked to
-"finish" something, check there first.
+hand-authored fixtures, no `scan_run`/`scan_job` retention, uncached registry tokens,
+offset pagination, anonymous-registry-only auth. If asked to "finish" something, check
+there first.
+
+If you add retention: `finding.first_seen_run_id` / `last_seen_run_id` are plain
+columns, not FKs, and the API inner-joins `scan_run` on them. Deleting a run a live
+finding still points at makes that finding vanish from the API silently.

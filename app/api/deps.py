@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
 from app.db.session import get_session
-from app.domain.models import RunStatus, ScanRun
+from app.domain.models import ScanRun
 from app.domain.severity import FILTERABLE, Severity
 
 
@@ -60,10 +60,15 @@ async def apply_freshness(
     Correct by construction rather than by invalidation: the data can only change
     when a scan completes, so the newest completion timestamp *is* the version. This
     is the caching story without a cache to get stale.
+
+    Every status counts, failures included. Findings only move on a success, but
+    ``GET /api/images`` also reports ``last_scan_at``, ``last_scan_status`` and
+    ``consecutive_failures``, and a failed run moves all three. Excluding failures
+    here would hand a revalidating client a 304 carrying ``consecutive_failures: 0``
+    for an image that has started rotting -- suppressing precisely the signal that
+    field exists to raise.
     """
-    newest = await session.scalar(
-        select(func.max(ScanRun.completed_at)).where(ScanRun.status != RunStatus.FAILED)
-    )
+    newest = await session.scalar(select(func.max(ScanRun.completed_at)))
     if newest is None:
         return False
 

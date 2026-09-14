@@ -71,10 +71,25 @@ def upgrade() -> None:
         sa.Column("scan_flags_hash", sa.String(64), nullable=True),
         sa.Column("duration_ms", sa.Integer(), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
+        # What the run found, by severity. NULL on a failed or skipped run: they
+        # produce no finding set, and 0 would read as "clean".
+        sa.Column("finding_count_critical", sa.Integer(), nullable=True),
+        sa.Column("finding_count_high", sa.Integer(), nullable=True),
+        sa.Column("finding_count_medium", sa.Integer(), nullable=True),
+        sa.Column("finding_count_low", sa.Integer(), nullable=True),
+        sa.Column("finding_count_unknown", sa.Integer(), nullable=True),
     )
     op.execute(
         "CREATE INDEX ix_scan_run_image_completed "
         "ON scan_run (image_id, completed_at DESC)"
+    )
+    # The API freshness validator: MAX(completed_at) across the whole table, on every
+    # collection request. The index above leads with image_id and cannot serve it.
+    op.execute("CREATE INDEX ix_scan_run_completed ON scan_run (completed_at DESC)")
+    # /health: the newest run that actually produced findings.
+    op.execute(
+        "CREATE INDEX ix_scan_run_last_success ON scan_run (completed_at DESC) "
+        "WHERE status = 'success'"
     )
 
     op.create_table(
@@ -125,10 +140,20 @@ def upgrade() -> None:
         sa.Column(
             "max_severity_rank", sa.SmallInteger(), server_default=sa.text("0"), nullable=False
         ),
+        # Maintained by the same recompute as max_severity; makes "is this CVE live?"
+        # an indexed predicate instead of an EXISTS over the whole finding table.
+        sa.Column(
+            "affected_image_count", sa.Integer(), server_default=sa.text("0"), nullable=False
+        ),
         sa.Column("published_at", TS, nullable=True),
         sa.Column("last_modified_at", TS, nullable=True),
     )
     op.create_index("ix_cve_max_severity_rank", "cve", ["max_severity_rank"])
+    # GET /api/cves in its exact shape: live CVEs, worst first.
+    op.execute(
+        "CREATE INDEX ix_cve_live_by_severity ON cve (max_severity_rank DESC, id) "
+        "WHERE affected_image_count > 0"
+    )
 
     op.create_table(
         "finding",

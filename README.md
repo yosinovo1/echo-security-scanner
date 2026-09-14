@@ -255,9 +255,9 @@ image ──┬──< scan_job          one active job per image, enforced by a
 |---|---|
 | `image` | The watch list: `(name, tag)`, optional per-image interval, pointers to the current run and last scan status, and `consecutive_failures` for the per-image backoff. |
 | `scan_job` | The queue. Status, priority, `scheduled_for`, `lease_until`, `attempts`. |
-| `scan_run` | One row per attempt, with the four fields that form the skip invariant plus duration and error. |
+| `scan_run` | One row per attempt, with the four fields that form the skip invariant, duration, error, and the per-severity counts that run produced. |
 | `package` | `(name, version, type)` — `type` is the ecosystem, so `openssl` as a Debian package and as a Python package are distinct. |
-| `cve` | Global CVE facts plus the derived `max_severity` rollup. |
+| `cve` | Global CVE facts plus two derived rollups over current findings: `max_severity` and `affected_image_count`. |
 | `finding` | The join that matters: a CVE in a package in an image, with **its own severity**, `fixed_version`, and `first_seen_run_id` / `last_seen_run_id`. |
 
 **A finding is "current" iff `finding.last_seen_run_id = image.current_scan_run_id`.**
@@ -437,6 +437,27 @@ Two decisions inside that are worth stating:
 `consecutive_failures` is reported on `GET /api/images`, so a rotting entry is
 visible rather than merely cheap.
 
+**And a third hole underneath both: the attempt nobody is alive to report.** A worker
+killed mid-scan — OOM on a large image, a Trivy crash, an evicted node — never reaches
+its own error handling. Its lease simply lapses and the scheduler returns the job to
+the queue. That reap used to be free: it incremented `attempts`, but only `queue.fail`
+ever compared `attempts` against the limit, and a dead worker never gets there.
+
+So a scan that *kills* its worker was a job that could never give up. It would be
+re-claimed forever, taking down one more worker each time, while
+`image.consecutive_failures` stayed at zero — because no *job* ever exhausted, the
+per-image backoff above never engaged either. Both safety nets were bypassed by the
+same gap, and it left no trace: no `scan_run` row, so the one failure with no
+surviving reporter was also the one failure with no record.
+
+Reaping now counts against the allowance and writes the attempt through the same
+`persist.record_failure` as any other, so a dead worker is bookkept exactly like a
+reported one. It lives in the scheduler rather than the workers because it is
+administration of a job this process does not own: deciding another worker is dead,
+and writing that worker's failure record. That is what the advisory-locked singleton
+is for — and keeping it out of the workers stops N of them racing on the same
+`UPDATE` every poll.
+
 ### Time-sensitive reorders work; it never skips safety gates
 
 A time-sensitive job jumps the priority lane and ignores "not due yet". It still
@@ -456,6 +477,98 @@ What is avoided is the invalidation surface. A missed invalidation means serving
 stale vulnerability data — the one wrong answer a security tool must never give.
 `ETag` and `Last-Modified` derived from the newest scan completion give the same
 benefit correct by construction, with nothing to go stale.
+
+The validator counts **every** completed run, failures included. Findings only move on
+a success, but `GET /api/images` also reports `last_scan_at`, `last_scan_status` and
+`consecutive_failures`, and a failed run moves all three. Excluding failures would
+hand a revalidating client a `304` carrying `consecutive_failures: 0` for an image
+that has started rotting — suppressing precisely the signal that field exists to
+raise. A validator is only correct if it covers everything the response can say.
+
+It is one `MAX(completed_at)`, and `scan_run` is the fastest-growing table in the
+schema, so it gets its own index: unindexed it is a sequential scan paid on every
+request, measured at 129 ms once a thousand-image fleet has a month of history
+(2.88 M rows), against 0.6 ms with the index.
+
+### Listing endpoints read rollups; they never aggregate
+
+Both list endpoints have an obvious implementation that aggregates the `finding`
+table per request, and both fall over at the scale this is designed for. `GET
+/api/images` sums severities per image — ~200,000 rows a page at a thousand images.
+`GET /api/cves` asks "is this CVE still found anywhere?" as an `EXISTS` per CVE, which
+the planner answers by hashing every current finding in the database.
+
+So each is precomputed by the scan that already knew the answer, and the read becomes
+an index lookup. Measured on 1000 images / 2M findings / 20k CVEs:
+
+| | aggregated per request | read from a rollup |
+|---|---|---|
+| `GET /api/images` (page of 100) | 283 ms | **2.0 ms** |
+| `GET /api/cves` — `count(*)` | 1,510 ms | **1.4 ms** |
+| `GET /api/cves` — page of 100 | 746 ms | **0.9 ms** |
+
+A covering index was tried first on the CVE path and rejected: 94 MB for a 2.5×
+improvement, because the planner still hashes the whole finding table.
+
+**Where each rollup lives, and why:**
+
+- **Per-severity counts live on `scan_run`** — the run that produced them — not on
+  `image`. A skipped run never advances `current_scan_run_id`, so the counts stay
+  pointing at the run whose findings are current, for free: the skip invariant
+  protects them with no extra code. `GET /api/images` was *already* joining that row
+  for the digest, so the aggregate query disappears rather than getting faster. It
+  also makes "did this image get worse?" a query rather than a diff.
+- **`cve.affected_image_count` is maintained by the existing `max_severity`
+  recompute** — same `GROUP BY` over current findings, so the second column is free.
+  `GET /api/cves?severity=` already trusted `max_severity_rank`, a derived column on
+  `cve`, for filtering; this extends a rollup the API depended on rather than
+  introducing a new kind of trust.
+
+**Isn't this the invalidation problem the [no-cache](#no-read-cache) section rejects?**
+No, and the distinction is the one that section actually rests on. A cache is a second
+system with its own lifetime, and a missed invalidation serves stale vulnerability
+data. These commit **in the same transaction as the findings they describe** — the
+same atomicity argument that makes Postgres the queue. There is no window in which
+they can disagree. The schema already denormalises `last_scan_at` and
+`last_scan_status` onto `image` for exactly this reason.
+
+Two honest edges:
+
+- **They are `NULL`, not `0`, on a failed or skipped run.** Those produce no finding
+  set, and a security tool must never render *we do not know* as *zero
+  vulnerabilities*.
+- **Deleting an `image` row leaves `affected_image_count` stale until the next scan
+  of any image sharing that CVE.** `max_severity` has always had this property, since
+  both are recomputed per scan rather than per finding change. Disabling an image —
+  the documented operation — is unaffected: its findings are still current, and it
+  genuinely still has them.
+
+### …and CVE rows are only written when something changed
+
+The same argument one level down. Every CVE in an image passes through both
+`_upsert_cves` and the `max_severity` rollup on every successful scan, and between two
+scans fifteen minutes apart essentially none of them have changed: not the
+description, not the rollup. Written unconditionally, a rescan rewrites thousands of
+rows to the values they already hold.
+
+Eight concurrent scanners over 400 shared CVEs, six rounds each:
+
+| | live rows | dead tuples | table size |
+|---|---|---|---|
+| unconditional writes | 400 | 38,000 | 2.9 MB |
+| written only on change | 400 | **0** | **168 kB** |
+
+So both paths are guarded: a `WHERE` on the `ON CONFLICT DO UPDATE`, and an
+`IS DISTINCT FROM` on the rollup. Both are needed — either one alone still rewrites
+the row. The `COALESCE` inside the upsert stays load-bearing alongside its guard,
+because the guard fires when *any* descriptive field is fillable while the `SET`
+touches all four; distributions genuinely report different subsets of those fields for
+the same CVE, so a scan supplying only a description must not blank a title an earlier
+scan learned.
+
+This was also checked for deadlocks, since two workers finishing images that share
+CVEs write overlapping row sets. Neither variant produced one — the cost of the
+unguarded version is churn, not contention.
 
 ### Trivy runs in client/server mode — measured, not assumed
 
@@ -522,17 +635,17 @@ immediately — it is enqueued on that tick rather than after a delay.
 ```bash
 pip install -r requirements-dev.txt
 
-pytest                                  # 164 with Postgres; 79 pass/85 skip without
+pytest                                  # 201 with Postgres; 79 pass/122 skip without
 ruff check app tests scripts            # lint
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 ```
 
-Runs without Docker: 79 tests pass and the 85 database-backed ones skip cleanly.
-With Postgres reachable, all 164 run:
+Runs without Docker: 79 tests pass and the 122 database-backed ones skip cleanly.
+With Postgres reachable, all 201 run:
 
 ```bash
 docker compose up -d postgres
-SCANNER_POSTGRES_HOST=localhost pytest      # 164 passed
+SCANNER_POSTGRES_HOST=localhost pytest      # 201 passed
 ```
 
 The database-backed tests rebuild their own `scanner_test` database from the models
@@ -567,6 +680,13 @@ means the stated requirements are demonstrably met.
   every decision Trivy output can force is exercised here: severity variance across
   distros, missing and empty `FixedVersion`, `Results: null`, the zero timestamp
   meaning "unknown", duplicate CVEs at the same package grain, and malformed output.
+- **`test_worker.py`** pins the failure policy itself. `run_once` is a dispatch
+  table -- each exception a scan can raise routes to defer at no cost, burn one
+  attempt, or burn the whole allowance -- and nothing else enforces it. The ordering
+  of its `except` clauses is load-bearing in particular: `RateLimited` and
+  `TrivyRateLimited` both subclass an exception a later clause catches, so reordering
+  them silently converts backpressure into permanent failure. Mutation-checked by
+  doing exactly that.
 - **`test_scheduling.py`** covers due-time arithmetic, the per-image failure backoff
   and its ceiling, the skip invariant — including the case a time-based heuristic gets
   wrong (fresh vulnerability DB, unchanged image) — and the lease/timeout guard.
@@ -593,6 +713,21 @@ means the stated requirements are demonstrably met.
   captured from a live run. Re-capture them with
   `trivy image --format json nginx:1.19` before trusting them as a regression
   baseline.
+- **`scan_run` and `scan_job` have no retention policy.** Nothing deletes either.
+  At a thousand images that is roughly **420 MB of `scan_run` per month** and ~96k
+  `scan_job` rows a day. The indexes above keep the queries fast regardless, so this
+  is a storage and backup cost rather than a latency one, but it is unbounded and a
+  real system would age both out. The trap for whoever does: `finding
+  .first_seen_run_id` and `last_seen_run_id` are plain columns, not foreign keys, and
+  the API *inner-joins* `scan_run` on them — so naive deletion silently drops findings
+  from the API rather than erroring. Any retention must keep every run still
+  referenced by a live finding.
+- **Registry tokens are not cached.** Each digest resolution costs three requests
+  (`HEAD` → 401, token, `HEAD` → 200) where Docker Hub's tokens are valid for ~300s.
+  That triples load against the one constraint this design calls binding. A
+  per-process TTL cache is the obvious fix and was left out only because it is
+  untested guesswork about token lifetimes across registries; authentication (above)
+  changes the arithmetic more.
 - **Pagination is `limit`/`offset`**, which degrades on deep pages. Result sets here
   top out in the tens of thousands, so keyset pagination is the scale-up path rather
   than a present need.
