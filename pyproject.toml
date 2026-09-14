@@ -1,0 +1,28 @@
+[tool.ruff]
+# Matches the width the code was written at.
+line-length = 96
+target-version = "py311"
+extend-exclude = ["app/db/migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "SIM",  # simplify
+    "C4",   # comprehensions
+    "RUF",
+]
+ignore = [
+    "B008",    # FastAPI's Depends() in defaults is the framework's idiom
+    "RUF012",  # SQLAlchemy __table_args__ tuples
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert against private helpers deliberately; fixtures shadow names.
+"tests/*" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
