@@ -58,7 +58,7 @@ admin shell).
 ### Verify — run all four before calling anything done
 
 ```bash
-pytest                                  # 89 with Postgres; 70 pass/19 skip without
+pytest                                  # 149 with Postgres; 70 pass/79 skip without
 ruff check app tests scripts            # must be clean
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 python scripts/verify_requirements.py --wait 900 --with-db   # e2e vs. the brief

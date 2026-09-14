@@ -485,17 +485,17 @@ immediately — it is enqueued on that tick rather than after a delay.
 ```bash
 pip install -r requirements-dev.txt
 
-pytest                                  # 89 with Postgres; 70 pass/19 skip without
+pytest                                  # 149 with Postgres; 70 pass/79 skip without
 ruff check app tests scripts            # lint
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 ```
 
-Runs without Docker: 70 tests pass and the 19 database-backed ones skip cleanly.
-With Postgres reachable, all 89 run:
+Runs without Docker: 70 tests pass and the 79 database-backed ones skip cleanly.
+With Postgres reachable, all 149 run:
 
 ```bash
 docker compose up -d postgres
-SCANNER_POSTGRES_HOST=localhost pytest      # 89 passed
+SCANNER_POSTGRES_HOST=localhost pytest      # 149 passed
 ```
 
 The database-backed tests create their own `scanner_test` database rather than
@@ -514,6 +514,15 @@ requirement it proves (1.1, 2.3, 3.4 …). `--with-db` additionally registers an
 unresolvable image to prove failures are recorded rather than swallowed. Exit code 0
 means the stated requirements are demonstrably met.
 
+- **`test_persist.py`** covers the three invariants that corrupt results *silently*
+  rather than raising: a skip must not advance `current_scan_run_id`; a finding that
+  stops being reported stops being current but is never deleted; and `max_severity` is
+  a rollup over current findings, recomputed *after* the pointer moves. Each was
+  mutation-checked — breaking the invariant in `persist.py` fails these tests, which
+  is the only reason to trust them.
+- **`test_api.py`** drives all five brief endpoints over `httpx.ASGITransport` against
+  real Postgres: severity counts that exclude stale findings, per-image severity
+  variance, slash-containing image names, conditional requests, and the 404/400 edges.
 - **`test_parser.py`** carries the weight. The subprocess boundary is mocked, so
   every decision Trivy output can force is exercised here: severity variance across
   distros, missing and empty `FixedVersion`, `Results: null`, the zero timestamp
