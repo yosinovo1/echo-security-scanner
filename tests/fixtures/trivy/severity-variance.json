@@ -1,0 +1,59 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": "ubuntu:20.04",
+  "ArtifactType": "container_image",
+  "Metadata": {
+    "ImageID": "sha256:1318b700e415001198d1bf66d260b07f67ca8a552b61b0da02b3832c778f221b",
+    "RepoTags": ["ubuntu:20.04"],
+    "OS": { "Family": "ubuntu", "Name": "20.04" }
+  },
+  "Results": [
+    {
+      "Target": "ubuntu:20.04 (ubuntu 20.04)",
+      "Class": "os-pkgs",
+      "Type": "ubuntu",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2022-0001",
+          "PkgName": "zlib1g",
+          "InstalledVersion": "1:1.2.11.dfsg-2ubuntu1",
+          "SeveritySource": "ubuntu",
+          "Severity": "LOW",
+          "Title": "First listing, vendor-rated LOW"
+        },
+        {
+          "VulnerabilityID": "CVE-2022-0001",
+          "PkgName": "zlib1g",
+          "InstalledVersion": "1:1.2.11.dfsg-2ubuntu1",
+          "SeveritySource": "nvd",
+          "Severity": "HIGH",
+          "Title": "Second listing of the same CVE and package, rated HIGH"
+        }
+      ]
+    },
+    {
+      "Target": "Python",
+      "Class": "lang-pkgs",
+      "Type": "python-pkg",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2022-0001",
+          "PkgName": "zlib1g",
+          "InstalledVersion": "1:1.2.11.dfsg-2ubuntu1",
+          "Severity": "MEDIUM",
+          "Title": "Same CVE and package name but a different package type"
+        }
+      ]
+    },
+    {
+      "Target": "broken",
+      "Class": "os-pkgs",
+      "Type": "debian",
+      "Vulnerabilities": [
+        { "PkgName": "no-cve-id", "InstalledVersion": "1.0", "Severity": "HIGH" },
+        { "VulnerabilityID": "CVE-2022-0002", "Severity": "HIGH" },
+        "not-an-object"
+      ]
+    }
+  ]
+}

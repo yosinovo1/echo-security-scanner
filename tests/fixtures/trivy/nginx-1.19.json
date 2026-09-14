@@ -1,0 +1,78 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": "nginx:1.19",
+  "ArtifactType": "container_image",
+  "Metadata": {
+    "ImageID": "sha256:f0b8a9a541369db503ff3b9d4fa6de561b300f7363920c2bff4577c6c24c5cf6",
+    "DiffIDs": [
+      "sha256:f5600c6330da7bb112776ba067a32a9c20842d6ecc8ee3289f1a713b644092f8"
+    ],
+    "RepoTags": ["nginx:1.19"],
+    "RepoDigests": [
+      "nginx@sha256:df13abe416e37eb3db4722840dd479b00ba193ac6606e7902331dcea50f4f1f2"
+    ],
+    "OS": { "Family": "debian", "Name": "10.8" }
+  },
+  "Results": [
+    {
+      "Target": "nginx:1.19 (debian 10.8)",
+      "Class": "os-pkgs",
+      "Type": "debian",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2021-3711",
+          "PkgName": "libssl1.1",
+          "PkgID": "libssl1.1@1.1.1d-0+deb10u5",
+          "InstalledVersion": "1.1.1d-0+deb10u5",
+          "FixedVersion": "1.1.1d-0+deb10u7",
+          "SeveritySource": "debian",
+          "Title": "openssl: SM2 Decryption Buffer Overflow",
+          "Description": "In order to decrypt SM2 encrypted data an application is expected to call the API function EVP_PKEY_decrypt().",
+          "Severity": "CRITICAL",
+          "PublishedDate": "2021-08-24T15:15:00Z",
+          "LastModifiedDate": "2022-04-05T18:15:00Z"
+        },
+        {
+          "VulnerabilityID": "CVE-2021-33574",
+          "PkgName": "libc6",
+          "PkgID": "libc6@2.28-10",
+          "InstalledVersion": "2.28-10",
+          "SeveritySource": "debian",
+          "Title": "glibc: mq_notify does not handle separately allocated thread attributes",
+          "Description": "The mq_notify function in the GNU C Library has a use-after-free.",
+          "Severity": "HIGH",
+          "PublishedDate": "2021-05-25T22:15:00Z",
+          "LastModifiedDate": "2022-06-02T15:15:00Z"
+        },
+        {
+          "VulnerabilityID": "CVE-2019-9923",
+          "PkgName": "tar",
+          "PkgID": "tar@1.30+dfsg-6",
+          "InstalledVersion": "1.30+dfsg-6",
+          "FixedVersion": "",
+          "SeveritySource": "debian",
+          "Title": "tar: null-pointer dereference in pax_decode_header",
+          "Description": "pax_decode_header in sparse.c in GNU Tar has a NULL pointer dereference.",
+          "Severity": "LOW",
+          "PublishedDate": "0001-01-01T00:00:00Z",
+          "LastModifiedDate": "0001-01-01T00:00:00Z"
+        },
+        {
+          "VulnerabilityID": "CVE-2021-UNKNOWN-SEV",
+          "PkgName": "coreutils",
+          "PkgID": "coreutils@8.30-3",
+          "InstalledVersion": "8.30-3",
+          "Severity": "NOT-A-REAL-SEVERITY",
+          "Title": "Synthetic row exercising unparseable severity",
+          "Description": "Present so the parser has to fall back to UNKNOWN."
+        }
+      ]
+    },
+    {
+      "Target": "Node.js",
+      "Class": "lang-pkgs",
+      "Type": "node-pkg",
+      "Vulnerabilities": null
+    }
+  ]
+}

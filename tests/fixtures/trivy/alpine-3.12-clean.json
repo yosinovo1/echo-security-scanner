@@ -1,0 +1,14 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": "alpine:3.12",
+  "ArtifactType": "container_image",
+  "Metadata": {
+    "ImageID": "sha256:389fef7118515c70fd6c0e0d50bb75669942ea722ccb976507d7b087e54d5a23",
+    "RepoTags": ["alpine:3.12"],
+    "RepoDigests": [
+      "alpine@sha256:c0e9560cda118f9ec63ddefb4a173a2b2a0347082d7dff7dc14272e7841a5b5a"
+    ],
+    "OS": { "Family": "alpine", "Name": "3.12.7" }
+  },
+  "Results": null
+}
