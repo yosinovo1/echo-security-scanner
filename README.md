@@ -30,9 +30,9 @@ Interactive API docs: **http://localhost:8000/docs**
 
 First run downloads the ~1.3 GB Trivy vulnerability database, so allow a couple of
 minutes before scanning begins. All ten images are then scanned in roughly five
-minutes — cold-start scans are spread over `SCANNER_INITIAL_SPREAD_SECONDS` (120 by
-default) rather than the full interval, and the first scan of each image pays for a
-cold layer pull. Subsequent rounds take seconds per image.
+minutes: every image is due immediately on a cold start, so the queue fills at once
+and drains at worker-pool rate, and the first scan of each image pays for a cold
+layer pull. Subsequent rounds take seconds per image.
 
 ### Watching it work
 
@@ -291,6 +291,25 @@ is not the deciding factor in either direction: peak load at 1000 images is abou
 The cost is about 40 lines: an `attempts` column, backoff arithmetic, and a reaper for
 expired leases.
 
+### No cold-start jitter, because the queue already absorbs the burst
+
+An earlier version spread never-scanned images across a window with a deterministic
+`hash(image_id)` offset. It was removed: **enqueueing is not scanning.**
+
+A thousand due images become a thousand queue rows in one `INSERT`, not a thousand
+concurrent scans. Real concurrency is bounded by worker replica count and by the
+registry budget, both downstream of the scheduler, so spreading the enqueue changed
+nothing a worker, Postgres or `trivy-server` could observe — it only delayed the
+first results and gave a manually added image a mystery delay before its first scan.
+Steady-state spread is not lost either: it comes from the rate at which the queue
+drains, which is what sets each image's `last_scan_at` in the first place.
+
+It also failed to cover the burst that actually happens in production. The jitter
+applied only to the never-scanned branch, so after an outage — every image overdue,
+`last_scan_at` set — the whole fleet became due on the first tick regardless. If
+thundering herd were a real problem here, that is the case worth solving, and the
+answer would be clamping catch-up rather than jittering first scans.
+
 ### Skip on a content invariant, not elapsed time
 
 A scan is skipped when the **digest, Trivy version, vulnerability DB version, and
@@ -397,7 +416,6 @@ Every setting is a `SCANNER_`-prefixed environment variable (see `app/config.py`
 |---|---|---|
 | `SCANNER_DEFAULT_SCAN_INTERVAL_SECONDS` | `900` | The brief's 15 minutes. Per-image overrides live in `image.scan_interval_seconds`. |
 | `SCANNER_SCHEDULER_TICK_SECONDS` | `10` | How often the scheduler looks for due images. |
-| `SCANNER_INITIAL_SPREAD_SECONDS` | `120` | Window over which never-scanned images are spread on a cold start. Raise it towards the interval when the image count makes a 2-minute burst significant. |
 | `SCANNER_TRIVY_SERVER_URL` | set in compose | Enables client mode. **Required for more than one worker** — see the contention measurement above. |
 | `SCANNER_LEASE_SECONDS` | `1200` | After this a claimed job is presumed dead and reclaimed. Must exceed the scan timeout, or a slow scan loses its lease mid-flight and gets duplicated onto another worker — enforced at startup. |
 | `SCANNER_MAX_ATTEMPTS` | `5` | Retries before a job is marked failed. A nonexistent image fails immediately. |
@@ -413,11 +431,8 @@ UPDATE image SET scan_interval_seconds = 300 WHERE name = 'nginx';
 UPDATE image SET enabled = false WHERE name = 'mongo';
 ```
 
-The scheduler picks up changes on its next tick. Scans are spread with a
-**deterministic** jitter (`hash(image_id) % window`) so a cold start does not fire
-every image at once, and — unlike random jitter — the spread survives restarts. A
-never-scanned image is spread over `SCANNER_INITIAL_SPREAD_SECONDS`; after its first
-scan the cadence carries the spread forward on its own.
+The scheduler picks up changes on its next tick, and a newly added image is due
+immediately — it is enqueued on that tick rather than after a delay.
 
 ---
 
@@ -426,17 +441,17 @@ scan the cadence carries the spread forward on its own.
 ```bash
 pip install -r requirements-dev.txt
 
-pytest                                  # 66 with Postgres; 47 pass/19 skip without
+pytest                                  # 61 with Postgres; 42 pass/19 skip without
 ruff check app tests scripts            # lint
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 ```
 
-Runs without Docker: 47 tests pass and the 19 database-backed ones skip cleanly.
-With Postgres reachable, all 66 run:
+Runs without Docker: 42 tests pass and the 19 database-backed ones skip cleanly.
+With Postgres reachable, all 61 run:
 
 ```bash
 docker compose up -d postgres
-SCANNER_POSTGRES_HOST=localhost pytest      # 66 passed
+SCANNER_POSTGRES_HOST=localhost pytest      # 61 passed
 ```
 
 The database-backed tests create their own `scanner_test` database rather than
@@ -459,9 +474,9 @@ means the stated requirements are demonstrably met.
   every decision Trivy output can force is exercised here: severity variance across
   distros, missing and empty `FixedVersion`, `Results: null`, the zero timestamp
   meaning "unknown", duplicate CVEs at the same package grain, and malformed output.
-- **`test_scheduling.py`** covers reference parsing, jitter stability, due-time
-  arithmetic, and the skip invariant — including the case a time-based heuristic gets
-  wrong (fresh vulnerability DB, unchanged image).
+- **`test_scheduling.py`** covers reference parsing, due-time arithmetic, and the
+  skip invariant — including the case a time-based heuristic gets wrong (fresh
+  vulnerability DB, unchanged image).
 - **`test_queue.py`** runs against real Postgres, because the queue's behaviour *is*
   PostgreSQL semantics: `SKIP LOCKED` and partial unique indexes. Testing it against
   SQLite would prove nothing.

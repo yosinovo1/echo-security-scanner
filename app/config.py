@@ -20,12 +20,6 @@ class Settings(BaseSettings):
     # image.scan_interval_seconds.
     default_scan_interval_seconds: int = 900
     scheduler_tick_seconds: int = 10
-    #: Window over which never-scanned images are spread on a cold start. The steady
-    #: state spreads itself, but a fresh deployment would otherwise fire every image
-    #: at once -- or, if spread across the whole interval, leave an operator staring
-    #: at an empty system for 15 minutes. Raise it towards the interval when the
-    #: image count is large enough that a 2-minute burst matters.
-    initial_spread_seconds: int = 120
 
     # Worker.
     worker_poll_seconds: int = 5

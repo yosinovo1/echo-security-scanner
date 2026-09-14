@@ -18,7 +18,6 @@ from app.config import Settings, get_settings
 from app.db.session import sync_session
 from app.domain.models import Image, JobStatus, ScanJob
 from app.jobs import queue
-from app.scheduler.jitter import jitter_offset
 
 log = logging.getLogger("scheduler")
 
@@ -37,19 +36,18 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def next_due_at(image: Image, default_interval: int, initial_spread: int) -> datetime:
+def next_due_at(image: Image, default_interval: int) -> datetime:
     """When this image should next be scanned.
 
-    A never-scanned image is offset by its deterministic jitter across
-    ``initial_spread`` rather than the whole interval: spreading a cold start over
-    the full 15 minutes avoids the thundering herd but leaves the system looking
-    empty for 15 minutes. After the first scan the cadence carries the spread
-    forward on its own.
+    A never-scanned image is due immediately. There is deliberately no cold-start
+    jitter: enqueueing is not scanning. A burst of due images becomes a burst of
+    queue rows, and concurrency is still bounded by worker replica count and the
+    registry budget, so spreading the enqueue only delays the first results. The
+    steady-state spread comes free from the rate at which the queue drains.
     """
     interval = image.scan_interval_seconds or default_interval
     if image.last_scan_at is None:
-        window = min(interval, initial_spread)
-        return image.created_at + timedelta(seconds=jitter_offset(image.id, window))
+        return image.created_at
     return image.last_scan_at + timedelta(seconds=interval)
 
 
@@ -65,8 +63,7 @@ def due_images(session: Session, settings: Settings) -> list[Image]:
     )
     now = _now()
     interval = settings.default_scan_interval_seconds
-    spread = settings.initial_spread_seconds
-    return [i for i in candidates if next_due_at(i, interval, spread) <= now]
+    return [i for i in candidates if next_due_at(i, interval) <= now]
 
 
 def tick(session: Session, settings: Settings) -> int:

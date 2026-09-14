@@ -1,4 +1,4 @@
-"""Pure-logic tests: reference parsing, jitter, and the skip invariant.
+"""Pure-logic tests: reference parsing, due-time arithmetic, and the skip invariant.
 
 These need no database and no network, so they run everywhere.
 """
@@ -13,7 +13,6 @@ from app.config import Settings
 from app.domain.models import Image, RunStatus, ScanRun
 from app.registry.digest import DOCKER_HUB_HOST, parse_reference
 from app.scanner.worker import _is_unchanged
-from app.scheduler.jitter import jitter_offset
 from app.scheduler.scheduler import next_due_at
 
 
@@ -49,22 +48,6 @@ class TestReferenceParsing:
         assert parse_reference("ghcr.io/a/b", "1").budget_key == "ghcr.io"
 
 
-class TestJitter:
-    def test_offset_is_inside_the_interval(self):
-        assert all(0 <= jitter_offset(i, 900) < 900 for i in range(1, 500))
-
-    def test_offset_is_stable_across_calls(self):
-        # The whole point over random jitter: restarts must not re-converge the herd.
-        assert jitter_offset(42, 900) == jitter_offset(42, 900)
-
-    def test_different_images_get_different_offsets(self):
-        offsets = {jitter_offset(i, 900) for i in range(1, 200)}
-        assert len(offsets) > 150  # well spread, allowing for hash collisions
-
-    def test_zero_interval_is_handled(self):
-        assert jitter_offset(1, 0) == 0
-
-
 class TestNextDue:
     def _image(self, **kwargs) -> Image:
         image = Image(name="nginx", tag="1.19")
@@ -74,27 +57,22 @@ class TestNextDue:
         image.scan_interval_seconds = kwargs.pop("scan_interval_seconds", None)
         return image
 
-    def test_never_scanned_image_is_spread_over_the_initial_window_not_the_interval(self):
-        # The whole point: a cold start must not leave the system idle for a full
-        # interval before anything is scanned.
+    def test_never_scanned_image_is_due_immediately(self):
+        # No cold-start jitter: the queue bounds concurrency, so delaying the enqueue
+        # would only delay the first results. A newly added image scans on the next
+        # tick rather than after a spread window.
         image = self._image()
-        expected = image.created_at + timedelta(seconds=jitter_offset(image.id, 120))
-        assert next_due_at(image, 900, 120) == expected
-        assert next_due_at(image, 900, 120) < image.created_at + timedelta(seconds=120)
-
-    def test_initial_window_never_exceeds_the_interval(self):
-        image = self._image(scan_interval_seconds=30)
-        assert next_due_at(image, 900, 120) < image.created_at + timedelta(seconds=30)
+        assert next_due_at(image, 900) == image.created_at
 
     def test_scanned_image_is_due_one_interval_after_the_last_scan(self):
         last = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
         image = self._image(last_scan_at=last)
-        assert next_due_at(image, 900, 120) == last + timedelta(seconds=900)
+        assert next_due_at(image, 900) == last + timedelta(seconds=900)
 
     def test_per_image_interval_overrides_the_global_default(self):
         last = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
         image = self._image(last_scan_at=last, scan_interval_seconds=60)
-        assert next_due_at(image, 900, 120) == last + timedelta(seconds=60)
+        assert next_due_at(image, 900) == last + timedelta(seconds=60)
 
 
 class TestSkipInvariant:

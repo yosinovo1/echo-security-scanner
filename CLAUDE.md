@@ -58,7 +58,7 @@ admin shell).
 ### Verify — run all four before calling anything done
 
 ```bash
-pytest                                  # 66 with Postgres; 47 pass/19 skip without
+pytest                                  # 61 with Postgres; 42 pass/19 skip without
 ruff check app tests scripts            # must be clean
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 python scripts/verify_requirements.py --wait 900 --with-db   # e2e vs. the brief
@@ -206,9 +206,10 @@ A change is done when all of these hold:
 
 ## Things that will bite
 
-- **`app/scanner/trivy.py` is deliberately ~12 lines and has no test coverage** (the
-  subprocess boundary is mocked). Do not grow it — every fallible decision belongs
-  below it in `parser.py`, which is exhaustively fixture-tested.
+- **`app/scanner/trivy.py` is deliberately thin (~120 lines, nearly half docstring)
+  and has no test coverage** (the subprocess boundary is mocked). Do not grow it —
+  every fallible decision belongs below it in `parser.py`, which is exhaustively
+  fixture-tested.
 - **The Trivy fixtures in `tests/fixtures/trivy/` are hand-authored** to the
   documented schema, not captured from a live run. Re-capture with
   `trivy image --format json nginx:1.19` before trusting them as a regression
