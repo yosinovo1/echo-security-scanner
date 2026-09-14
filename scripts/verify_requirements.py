@@ -223,8 +223,7 @@ def check_schema(client: httpx.Client, report: Report, use_db: bool) -> None:
         tables = set(psql(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
         ).splitlines())
-        expected = {"image", "scan_job", "scan_run", "package", "cve", "finding",
-                    "registry_budget"}
+        expected = {"image", "scan_job", "scan_run", "package", "cve", "finding"}
         report.check("2.5", "expected tables exist", expected <= tables,
                      f"missing: {sorted(expected - tables)}" if expected - tables
                      else f"{len(expected)} tables")

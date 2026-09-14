@@ -248,7 +248,6 @@ image ──┬──< scan_job          one active job per image, enforced by a
                  │
                  └──── package
 
-registry_budget                token bucket, one row per registry host
 ```
 
 | Table | Holds |
@@ -259,7 +258,6 @@ registry_budget                token bucket, one row per registry host
 | `package` | `(name, version, type)` — `type` is the ecosystem, so `openssl` as a Debian package and as a Python package are distinct. |
 | `cve` | Global CVE facts plus the derived `max_severity` rollup. |
 | `finding` | The join that matters: a CVE in a package in an image, with **its own severity**, `fixed_version`, and `first_seen_run_id` / `last_seen_run_id`. |
-| `registry_budget` | Remaining request allowance per registry host. |
 
 **A finding is "current" iff `finding.last_seen_run_id = image.current_scan_run_id`.**
 Every read path filters on this. Findings are never deleted: one that stops being
@@ -298,7 +296,7 @@ An earlier version spread never-scanned images across a window with a determinis
 
 A thousand due images become a thousand queue rows in one `INSERT`, not a thousand
 concurrent scans. Real concurrency is bounded by worker replica count and by the
-registry budget, both downstream of the scheduler, so spreading the enqueue changed
+registry itself, both downstream of the scheduler, so spreading the enqueue changed
 nothing a worker, Postgres or `trivy-server` could observe — it only delayed the
 first results and gave a manually added image a mystery delay before its first scan.
 Steady-state spread is not lost either: it comes from the rate at which the queue
@@ -342,24 +340,72 @@ defined meaning.
 **The rollup rule: a CVE is CRITICAL if it is CRITICAL in any scanned image.** It is
 recomputed after every scan over current findings only.
 
-### The registry is the binding constraint, not the worker pool
+### The registry is the binding constraint — but it is not ours to model
 
-Ten images every fifteen minutes is already a few hundred manifest fetches per
+Ten images every fifteen minutes is already a few hundred registry requests per
 six-hour window, and registries throttle anonymous clients well below that. At a
-thousand images it is not close.
+thousand images it is not close. That much is right, and it is why a throttled job is
+**deferred, not failed**: backpressure must never burn a job's retry allowance, or a
+slow afternoon at Docker Hub walks the whole fleet to permanently failed.
 
-So every registry touch — digest resolution included — spends a token from a
-per-registry bucket, and a throttled job is **deferred, not failed**: backpressure
-must not burn a job's retry allowance. The default budget is deliberately
-conservative; see [Configuration](#configuration).
+The first design drew the wrong conclusion from it. It carried a Postgres token
+bucket (`registry_budget`) that modelled Docker Hub's anonymous ceiling locally —
+100 requests per six hours — and deferred jobs when the *local* count ran out.
 
-> Docker Hub's published anonymous limits have changed over time. Check the current
-> figures before tuning `SCANNER_REGISTRY_BUDGET_TOKENS` upward.
+**It was deleted after running it.** Three reasons, ascending:
+
+1. **The constant was a guess at someone else's number.** Docker Hub's anonymous
+   limit has changed repeatedly, is scoped per-IP for anonymous clients, and differs
+   by authentication state. Any value compiled in here is wrong behind a different
+   NAT. The giveaway was the footnote this section used to carry: *"check the current
+   figures before tuning."* A limiter whose documentation tells you to go verify its
+   central constant against an external source is not a limiter — it is a stale cache
+   of a fact we do not own.
+
+2. **It was a second source of truth,** which is precisely the argument made against
+   a broker two sections up. The registry holds the authoritative count; we kept a
+   divergent local replica and reconciled it with nothing.
+
+3. **It caused a worse outage than the limit it modelled.** This is the one that
+   settled it. Left running for three hours, the stack reported:
+
+   ```
+   registry-1.docker.io | tokens=0 | capacity=100 | elapsed=02:59:44
+   ```
+
+   Ten images at a fifteen-minute cadence need **240** manifest requests per six-hour
+   window against a modelled capacity of **100**, so the budget ran dry a third of the
+   way in and every job sat `pending` with `registry budget exhausted`. No image was
+   scanned for the rest of the window, `/health` still answered `ok`, and the API went
+   on serving three-hour-old findings as current. The protection was doing more damage
+   than the throttling it existed to prevent — and it was doing it silently, which for
+   a security tool is the worst available failure mode.
+
+   Worse, it was charging for something free: Docker Hub counts manifest **GET**s, and
+   documents `HEAD` as the way to check your allowance *without* spending it. The skip
+   path — 72 of 90 runs on that stack — was paying a toll that does not exist.
+
+**What replaced it is the registry's own answer.** A `429` raises `RateLimited`
+carrying the registry's `Retry-After`, and the worker defers for exactly that long.
+Trivy's pulls are classified the same way, from stderr, in
+[`parser.is_rate_limit_error`](app/scanner/parser.py) — matching on prose is fallible,
+so it lives in the fixture-tested module rather than at the subprocess boundary, and
+the markers deliberately exclude a bare `429` because layer digests contain those
+characters.
+
+Net effect: one table, one module and two config knobs removed, and backpressure is
+now driven by the only party that actually knows the limit.
+
+> At a thousand images none of this is sufficient on its own — that workload needs
+> ~24,000 manifest requests per window against an anonymous ceiling of ~100. The
+> answer there is authentication or a pull-through mirror, not a smarter counter. See
+> [Known limitations](#known-limitations).
 
 ### Time-sensitive reorders work; it never skips safety gates
 
 A time-sensitive job jumps the priority lane and ignores "not due yet". It still
-spends registry budget, and it is still skipped if the content invariant holds.
+yields to a registry that is throttling us, and it is still skipped if the content
+invariant holds.
 Urgency justifies reordering work — never doing provably useless work, and never
 getting the IP throttled.
 
@@ -418,9 +464,7 @@ Every setting is a `SCANNER_`-prefixed environment variable (see `app/config.py`
 | `SCANNER_SCHEDULER_TICK_SECONDS` | `10` | How often the scheduler looks for due images. |
 | `SCANNER_TRIVY_SERVER_URL` | set in compose | Enables client mode. **Required for more than one worker** — see the contention measurement above. |
 | `SCANNER_LEASE_SECONDS` | `1200` | After this a claimed job is presumed dead and reclaimed. Must exceed the scan timeout, or a slow scan loses its lease mid-flight and gets duplicated onto another worker — enforced at startup. |
-| `SCANNER_MAX_ATTEMPTS` | `5` | Retries before a job is marked failed. A nonexistent image fails immediately. |
-| `SCANNER_REGISTRY_BUDGET_TOKENS` | `100` | Requests per window, per registry host. |
-| `SCANNER_REGISTRY_BUDGET_WINDOW_SECONDS` | `21600` | Six hours. |
+| `SCANNER_MAX_ATTEMPTS` | `5` | Retries before a job is marked failed. A nonexistent image fails immediately. A registry throttling us does not count as an attempt at all. |
 | `SCANNER_PAGE_SIZE_DEFAULT` / `_MAX` | `100` / `1000` | Pagination. |
 
 ### Adding or retuning images
@@ -441,17 +485,17 @@ immediately — it is enqueued on that tick rather than after a delay.
 ```bash
 pip install -r requirements-dev.txt
 
-pytest                                  # 61 with Postgres; 42 pass/19 skip without
+pytest                                  # 89 with Postgres; 70 pass/19 skip without
 ruff check app tests scripts            # lint
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 ```
 
-Runs without Docker: 42 tests pass and the 19 database-backed ones skip cleanly.
-With Postgres reachable, all 61 run:
+Runs without Docker: 70 tests pass and the 19 database-backed ones skip cleanly.
+With Postgres reachable, all 89 run:
 
 ```bash
 docker compose up -d postgres
-SCANNER_POSTGRES_HOST=localhost pytest      # 61 passed
+SCANNER_POSTGRES_HOST=localhost pytest      # 89 passed
 ```
 
 The database-backed tests create their own `scanner_test` database rather than
@@ -474,9 +518,15 @@ means the stated requirements are demonstrably met.
   every decision Trivy output can force is exercised here: severity variance across
   distros, missing and empty `FixedVersion`, `Results: null`, the zero timestamp
   meaning "unknown", duplicate CVEs at the same package grain, and malformed output.
-- **`test_scheduling.py`** covers reference parsing, due-time arithmetic, and the
-  skip invariant — including the case a time-based heuristic gets wrong (fresh
-  vulnerability DB, unchanged image).
+- **`test_scheduling.py`** covers due-time arithmetic, the skip invariant — including
+  the case a time-based heuristic gets wrong (fresh vulnerability DB, unchanged
+  image) — and the lease/timeout configuration guard.
+- **`test_registry.py`** drives the registry client over `httpx.MockTransport`, so it
+  runs offline: reference parsing, the bearer-token challenge, and the throttling path
+  that replaced the token bucket — `429` on both the manifest *and* the token
+  endpoint, and `Retry-After` in both the delta-seconds and HTTP-date forms.
+- **`test_trivy.py`** pins exit-code classification only. Throttling and failure both
+  exit 1, and confusing them is silent in both directions.
 - **`test_queue.py`** runs against real Postgres, because the queue's behaviour *is*
   PostgreSQL semantics: `SKIP LOCKED` and partial unique indexes. Testing it against
   SQLite would prove nothing.
@@ -485,9 +535,11 @@ means the stated requirements are demonstrably met.
 
 ## Known limitations
 
-- **The Trivy subprocess boundary is not covered by tests** — argv, exit codes, and
-  timeouts. `app/scanner/trivy.py` is kept to about a dozen lines specifically so
-  this untested surface stays trivial.
+- **The Trivy subprocess boundary is only thinly tested** — exit-code classification
+  is pinned (`tests/test_trivy.py`), because confusing throttling with failure is
+  silent in both directions. Argv construction and real process behaviour are not
+  covered; `app/scanner/trivy.py` is kept tiny specifically so that surface stays
+  trivial.
 - **The Trivy fixtures are hand-authored** to the documented schema rather than
   captured from a live run. Re-capture them with
   `trivy image --format json nginx:1.19` before trusting them as a regression
@@ -497,7 +549,9 @@ means the stated requirements are demonstrably met.
   than a present need.
 - **Registry authentication is anonymous only.** Private registries would need
   credentials threaded through `app/registry/digest.py` and into the Trivy
-  invocation — and would also raise the budget ceiling considerably.
+  invocation. This is also the real answer to registry throttling at scale: an
+  authenticated account, or a pull-through mirror, raises the ceiling by orders of
+  magnitude where tuning a client-side limit cannot.
 - **Scaling is replica count**, a consequence of one-scan-per-process. Roughly 1000
   images at a 15-minute cadence implies dozens of worker processes — and at that
   point `trivy-server` becomes the next thing to measure, since every worker scans

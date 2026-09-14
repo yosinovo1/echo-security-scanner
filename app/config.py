@@ -47,10 +47,9 @@ class Settings(BaseSettings):
     #: (measured: 6s uncontended vs 116s with two workers on one cache).
     trivy_server_url: str | None = None
 
-    # Registry token bucket. Docker Hub's documented anonymous ceiling has moved over
-    # time; these defaults stay deliberately under it. See docs/README for rationale.
-    registry_budget_tokens: int = 100
-    registry_budget_window_seconds: int = 21600
+    # There is deliberately no local registry rate limit. Registries publish their
+    # own throttling via 429 + Retry-After, and that signal is authoritative where a
+    # compiled-in ceiling is a guess that goes stale. See the README.
 
     # API pagination. The default is chosen so that an unparameterised request against
     # the brief's 10 images behaves exactly as the brief describes.

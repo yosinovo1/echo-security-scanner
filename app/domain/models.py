@@ -109,8 +109,8 @@ class ScanJob(Base):
         _enum(JobStatus, "job_status"), server_default=JobStatus.PENDING.value
     )
     #: Higher first. Time-sensitive jobs are enqueued above the scheduled baseline;
-    #: priority reorders work but never bypasses the registry budget or the
-    #: content invariant.
+    #: priority reorders work but never bypasses the content invariant, and never
+    #: overrides a registry that is throttling us.
     priority: Mapped[int] = mapped_column(SmallInteger, server_default=text("0"))
     scheduled_for: Mapped[datetime] = mapped_column(TS, server_default=func.now())
     lease_until: Mapped[datetime | None] = mapped_column(TS, nullable=True)
@@ -241,19 +241,3 @@ class Finding(Base):
         Index("ix_finding_image_severity", "image_id", "severity_rank"),
         Index("ix_finding_last_seen", "last_seen_run_id"),
     )
-
-
-class RegistryBudget(Base):
-    """Token bucket guarding registry pulls.
-
-    At 1000 images the registry, not the worker pool, is the binding constraint, so
-    every registry touch (digest resolution included) spends a token.
-    """
-
-    __tablename__ = "registry_budget"
-
-    registry: Mapped[str] = mapped_column(String(255), primary_key=True)
-    tokens: Mapped[int] = mapped_column(Integer)
-    capacity: Mapped[int] = mapped_column(Integer)
-    window_seconds: Mapped[int] = mapped_column(Integer)
-    window_started_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())

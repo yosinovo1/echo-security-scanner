@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 
 from app.domain.severity import Severity
-from app.scanner.parser import ParsedFinding, TrivyReportError, parse_report
+from app.scanner.parser import (
+    ParsedFinding,
+    TrivyReportError,
+    is_rate_limit_error,
+    parse_report,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trivy"
 
@@ -152,3 +157,43 @@ class TestMalformedOutput:
 
     def test_accepts_bytes(self):
         assert parse_report(b'{"Results": []}').findings == ()
+
+
+class TestRateLimitClassification:
+    """Telling throttling apart from failure, from stderr prose.
+
+    The two outcomes are opposites -- defer without cost, or spend a retry -- and
+    Trivy exits 1 for both, so this predicate is the only thing separating them.
+    """
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "toomanyrequests: You have reached your pull rate limit.",
+            "GET https://registry-1.docker.io/v2/: TOOMANYREQUESTS",
+            "unexpected status code 429 Too Many Requests",
+            "Error: rate limit exceeded for anonymous pulls",
+        ],
+    )
+    def test_registry_throttling_is_recognised(self, stderr):
+        assert is_rate_limit_error(stderr) is True
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "MANIFEST_UNKNOWN: manifest unknown",
+            "failed to resolve target image: unauthorized",
+            "context deadline exceeded",
+            "",
+            None,
+        ],
+    )
+    def test_ordinary_failures_are_left_alone(self, stderr):
+        assert is_rate_limit_error(stderr) is False
+
+    def test_a_digest_containing_429_is_not_throttling(self):
+        # The false positive that matters: a bare "429" substring match would defer
+        # this forever without ever counting an attempt.
+        assert is_rate_limit_error(
+            "failed to get manifest sha256:429f1c0e429b2a: MANIFEST_UNKNOWN"
+        ) is False

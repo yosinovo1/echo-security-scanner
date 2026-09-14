@@ -41,7 +41,8 @@ An Image has at most one *active* (queued or in-progress) Scan Job at a time.
 
 A property of a Scan Job meaning it should be done ahead of routine work. It changes
 *ordering* only. It does not entitle a job to exceed the
-[Registry budget](#registry-budget) or to repeat a scan whose result is already known.
+[Backpressure](#backpressure) from a registry, or to repeat a scan whose result is
+already known.
 
 ## Scan Run
 
@@ -109,12 +110,18 @@ is `CRITICAL` if it is `CRITICAL` in any scanned Image. This exists so that a
 question about a CVE in isolation ("list all CRITICAL CVEs") has a defined answer.
 It is a derived summary, and the per-Finding Severity remains the ground truth.
 
-## Registry budget
+## Backpressure
 
-The allowance of requests the system may make to an image registry in a given period.
-Registries throttle anonymous clients, so the budget is a shared, finite resource
-rather than an implementation detail — at scale it, rather than available compute, is
-what limits how often Images can be scanned.
+A registry declining to serve us *right now* because we are asking too often.
 
-Exceeding the budget is not an error condition; being *near* it is a reason to defer
-work, and deferral is distinct from [failure](#scan-run).
+Backpressure is **not** [failure](#scan-run). A failure says the work cannot be done;
+backpressure says it cannot be done *yet*. The distinction is operational, not
+pedantic: a Scan Job that fails spends one of its finite attempts and eventually gives
+up, whereas one that meets backpressure is deferred at no cost and will be tried
+again. Treating the second as the first would let a busy hour at a registry retire
+every Image in the system as permanently failed.
+
+The system does not predict backpressure or budget against it — the registry is the
+only party that knows its own limits, and it reports them (an HTTP `429`, usually with
+a `Retry-After`). At scale the registry, rather than available compute, is what limits
+how often Images can be scanned.

@@ -159,18 +159,8 @@ def upgrade() -> None:
     op.create_index("ix_finding_image_severity", "finding", ["image_id", "severity_rank"])
     op.create_index("ix_finding_last_seen", "finding", ["last_seen_run_id"])
 
-    op.create_table(
-        "registry_budget",
-        sa.Column("registry", sa.String(255), primary_key=True),
-        sa.Column("tokens", sa.Integer(), nullable=False),
-        sa.Column("capacity", sa.Integer(), nullable=False),
-        sa.Column("window_seconds", sa.Integer(), nullable=False),
-        sa.Column("window_started_at", TS, server_default=sa.func.now(), nullable=False),
-    )
-
 
 def downgrade() -> None:
-    op.drop_table("registry_budget")
     op.drop_table("finding")
     op.drop_index("ix_cve_max_severity_rank", table_name="cve")
     op.drop_table("cve")

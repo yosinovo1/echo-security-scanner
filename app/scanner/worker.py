@@ -19,14 +19,20 @@ from app.config import Settings, get_settings
 from app.db.session import sync_session
 from app.domain.models import Image, RunStatus, ScanJob, ScanRun
 from app.jobs import queue
-from app.ratelimit import budget
-from app.registry.digest import ImageNotFound, RegistryError, parse_reference, resolve_digest
+from app.registry.digest import (
+    ImageNotFound,
+    RateLimited,
+    RegistryError,
+    parse_reference,
+    resolve_digest,
+)
 from app.scanner import persist, trivy
 from app.scanner.parser import ParsedReport, TrivyReportError, parse_report
 
 log = logging.getLogger("worker")
 
-#: How long to wait when the registry budget is exhausted but no refill time is known.
+#: Fallback wait when a registry throttles us without saying for how long. Registries
+#: normally send ``Retry-After``; this only covers the ones that do not.
 DEFAULT_DEFER_SECONDS = 300
 
 
@@ -102,31 +108,14 @@ def _execute(session: Session, job: ScanJob, settings: Settings) -> None:
             completed_at=_now(),
         )
 
-    # A manifest HEAD is still a registry request, so it is charged a token.
-    if not budget.try_consume(
-        session,
-        reference.budget_key,
-        capacity=settings.registry_budget_tokens,
-        window_seconds=settings.registry_budget_window_seconds,
-    ):
-        delay = (
-            budget.seconds_until_refill(session, reference.budget_key)
-            or DEFAULT_DEFER_SECONDS
-        )
-        queue.defer(
-            session, job, delay, f"registry budget exhausted for {reference.budget_key}"
-        )
-        session.commit()
-        log.info("deferred %s for %ss: registry budget", image.reference, delay)
-        return
-
-    # Commit the token before spending it: if the request then fails, a rollback
-    # would hand back an allowance the registry has already counted against us.
+    # Everything the decision needs is read up front, then the transaction ends: a
+    # scan takes minutes, and holding a connection (and its snapshot) open across a
+    # subprocess pins one of a small pool and blocks vacuum for the duration.
+    previous = _last_successful_run(session, image.id)
     session.commit()
 
     digest = resolve_digest(reference)
 
-    previous = _last_successful_run(session, image.id)
     if _is_unchanged(previous, digest, trivy_version, db_version, flags_hash):
         # Applies to time-sensitive jobs too: urgency justifies reordering work, not
         # doing work whose result is already known.
@@ -135,24 +124,6 @@ def _execute(session: Session, job: ScanJob, settings: Settings) -> None:
         session.commit()
         log.info("skipped %s: digest and vulnerability DB unchanged", image.reference)
         return
-
-    if not budget.try_consume(
-        session,
-        reference.budget_key,
-        capacity=settings.registry_budget_tokens,
-        window_seconds=settings.registry_budget_window_seconds,
-    ):
-        delay = (
-            budget.seconds_until_refill(session, reference.budget_key)
-            or DEFAULT_DEFER_SECONDS
-        )
-        queue.defer(
-            session, job, delay, f"registry budget exhausted for {reference.budget_key}"
-        )
-        session.commit()
-        return
-
-    session.commit()  # release the budget write before a minutes-long subprocess
 
     raw = trivy.run_scan(image.reference, settings)
     report: ParsedReport = parse_report(raw)
@@ -169,6 +140,24 @@ def _execute(session: Session, job: ScanJob, settings: Settings) -> None:
         len(report.findings),
         run_meta.duration_ms,
     )
+
+
+def _defer_for_backpressure(
+    session: Session, job: ScanJob, error: RateLimited | trivy.TrivyRateLimited
+) -> None:
+    """Registry throttling is backpressure, not failure.
+
+    No ``scan_run`` row is written, because nothing was attempted -- and crucially no
+    attempt is burnt, or a throttled registry would walk every image to permanently
+    failed. ``Retry-After`` is the registry's own answer to "how long"; it is better
+    information than any local model of its limits, which is the whole reason this
+    replaced a token bucket.
+    """
+    session.rollback()
+    delay = getattr(error, "retry_after", None) or DEFAULT_DEFER_SECONDS
+    queue.defer(session, job, delay, f"{type(error).__name__}: {error}")
+    session.commit()
+    log.info("deferred job %s for %ss: registry throttled us", job.id, delay)
 
 
 def _record_failure(
@@ -221,6 +210,9 @@ def run_once(session: Session, settings: Settings) -> bool:
         _execute(session, job, settings)
     except ImageNotFound as exc:
         _record_failure(session, job, exc, settings, permanent=True)
+    # Before the broader clause below: both subclass an exception listed there.
+    except (RateLimited, trivy.TrivyRateLimited) as exc:
+        _defer_for_backpressure(session, job, exc)
     except (RegistryError, trivy.TrivyError, TrivyReportError) as exc:
         _record_failure(session, job, exc, settings, permanent=False)
     except Exception as exc:

@@ -2,15 +2,20 @@
 
 This is a manifest ``HEAD``, not a layer pull, which is what makes the skip
 invariant cheap: one small request tells us whether a full scan could possibly
-produce a different answer.
+produce a different answer. Docker Hub does not count a ``HEAD`` against its pull
+limit at all -- it documents it as the way to inspect your allowance without
+spending it -- so the common case (an unchanged image) costs nothing.
 
-It still costs a token against the registry budget, because registries count
-manifest requests toward their pull limits.
+Throttling is discovered, not predicted: a ``429`` raises :class:`RateLimited`
+carrying the registry's own ``Retry-After``, and the worker defers on it. See the
+README for why this replaced a locally-modelled token bucket.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -36,16 +41,24 @@ class ImageNotFound(RegistryError):
     """The reference does not exist. Retrying will not help."""
 
 
+class RateLimited(RegistryError):
+    """The registry is throttling us.
+
+    Backpressure, not failure: the worker defers on this without burning a retry
+    allowance. ``retry_after`` is the registry's own answer to "how long", which is
+    strictly better information than any limit we could model locally.
+    """
+
+    def __init__(self, message: str, retry_after: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 @dataclass(frozen=True, slots=True)
 class ImageReference:
     host: str
     repository: str
     tag: str
-
-    @property
-    def budget_key(self) -> str:
-        """Token buckets are per registry host, since that is what rate-limits us."""
-        return self.host
 
 
 def parse_reference(name: str, tag: str) -> ImageReference:
@@ -62,6 +75,29 @@ def parse_reference(name: str, tag: str) -> ImageReference:
     return ImageReference(host=DOCKER_HUB_HOST, repository=repository, tag=tag)
 
 
+def parse_retry_after(raw: str | None) -> int | None:
+    """Read a ``Retry-After`` header, which RFC 9110 allows in two forms.
+
+    Delta-seconds is what registries normally send; an HTTP-date is legal and is
+    handled rather than silently ignored, since getting this wrong means retrying
+    into a throttle that is still in force.
+    """
+    if not raw:
+        return None
+    value = raw.strip()
+    try:
+        return max(0, int(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0, int((when - datetime.now(UTC)).total_seconds()))
+
+
 def _parse_challenge(header: str) -> dict[str, str]:
     return dict(_CHALLENGE.findall(header))
 
@@ -72,6 +108,14 @@ def _fetch_token(client: httpx.Client, challenge: dict[str, str]) -> str | None:
         return None
     params = {k: v for k, v in challenge.items() if k in ("service", "scope") and v}
     response = client.get(realm, params=params)
+    # Registries meter the token endpoint separately from the manifest endpoint, so
+    # throttling can surface here first. Classified as backpressure rather than an
+    # auth failure, or a throttled registry would burn retries on a healthy image.
+    if response.status_code == 429:
+        raise RateLimited(
+            f"auth endpoint {realm} is throttling us",
+            retry_after=parse_retry_after(response.headers.get("Retry-After")),
+        )
     if response.status_code != 200:
         raise RegistryError(f"auth failed at {realm}: HTTP {response.status_code}")
     payload = response.json()
@@ -98,6 +142,11 @@ def resolve_digest(reference: ImageReference, *, timeout: float = 30.0) -> str:
                     headers["Authorization"] = f"Bearer {token}"
                     response = client.head(url, headers=headers)
 
+            if response.status_code == 429:
+                raise RateLimited(
+                    f"{reference.host} is throttling us",
+                    retry_after=parse_retry_after(response.headers.get("Retry-After")),
+                )
             if response.status_code == 404:
                 raise ImageNotFound(f"{reference.repository}:{reference.tag} not found")
             if response.status_code != 200:

@@ -112,9 +112,9 @@ async def request_scan(
     time_sensitive: bool = Query(
         default=False,
         description=(
-            "Jump the queue. Reorders work only: the scan still spends registry "
-            "budget, and is still skipped if the image and vulnerability database "
-            "are provably unchanged."
+            "Jump the queue. Reorders work only: the scan still yields to a "
+            "registry that is throttling us, and is still skipped if the image and "
+            "vulnerability database are provably unchanged."
         ),
     ),
     session: AsyncSession = Depends(get_session),

@@ -42,7 +42,7 @@ def next_due_at(image: Image, default_interval: int) -> datetime:
     A never-scanned image is due immediately. There is deliberately no cold-start
     jitter: enqueueing is not scanning. A burst of due images becomes a burst of
     queue rows, and concurrency is still bounded by worker replica count and the
-    registry budget, so spreading the enqueue only delays the first results. The
+    registry itself, so spreading the enqueue only delays the first results. The
     steady-state spread comes free from the rate at which the queue drains.
     """
     interval = image.scan_interval_seconds or default_interval

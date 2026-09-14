@@ -1,6 +1,7 @@
-"""Pure-logic tests: reference parsing, due-time arithmetic, and the skip invariant.
+"""Pure-logic tests: due-time arithmetic, the skip invariant, and lease configuration.
 
-These need no database and no network, so they run everywhere.
+These need no database and no network, so they run everywhere. Registry reference
+parsing lives in ``test_registry.py`` alongside the rest of the registry client.
 """
 from __future__ import annotations
 
@@ -11,41 +12,8 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.domain.models import Image, RunStatus, ScanRun
-from app.registry.digest import DOCKER_HUB_HOST, parse_reference
 from app.scanner.worker import _is_unchanged
 from app.scheduler.scheduler import next_due_at
-
-
-class TestReferenceParsing:
-    def test_single_component_name_lives_under_library(self):
-        ref = parse_reference("nginx", "1.19")
-        assert ref.host == DOCKER_HUB_HOST
-        assert ref.repository == "library/nginx"
-        assert ref.tag == "1.19"
-
-    def test_two_component_docker_hub_name_is_left_alone(self):
-        ref = parse_reference("bitnami/redis", "6.0")
-        assert ref.host == DOCKER_HUB_HOST
-        assert ref.repository == "bitnami/redis"
-
-    @pytest.mark.parametrize(
-        "name,host,repository",
-        [
-            ("ghcr.io/acme/api", "ghcr.io", "acme/api"),
-            ("registry.example.com/team/app", "registry.example.com", "team/app"),
-            ("localhost/dev", "localhost", "dev"),
-            ("localhost:5000/dev", "localhost:5000", "dev"),
-        ],
-    )
-    def test_leading_component_is_a_host_only_when_it_looks_like_one(
-        self, name, host, repository
-    ):
-        ref = parse_reference(name, "latest")
-        assert (ref.host, ref.repository) == (host, repository)
-
-    def test_budget_is_keyed_by_host_since_that_is_what_rate_limits_us(self):
-        assert parse_reference("nginx", "1.19").budget_key == DOCKER_HUB_HOST
-        assert parse_reference("ghcr.io/a/b", "1").budget_key == "ghcr.io"
 
 
 class TestNextDue:

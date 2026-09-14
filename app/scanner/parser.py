@@ -5,6 +5,10 @@ than in ``trivy.py``: severity variance across distros, a missing ``FixedVersion
 a null ``Results``, a vulnerability listed twice under different targets, junk dates.
 ``trivy.py`` is deliberately a dozen lines of subprocess plumbing so that this module
 carries the logic the tests can actually exercise.
+
+That includes what Trivy says when it *fails*: :func:`is_rate_limit_error` reads
+stderr to tell registry throttling apart from a real error, because the two deserve
+opposite responses -- defer versus burn a retry.
 """
 from __future__ import annotations
 
@@ -17,6 +21,37 @@ from app.domain.severity import Severity, parse_severity, rank
 
 class TrivyReportError(ValueError):
     """Raised when Trivy output cannot be interpreted at all."""
+
+
+#: Substrings that identify registry throttling in Trivy's stderr. Trivy surfaces the
+#: registry's own wording, so this matches what Docker Hub and the OCI distribution
+#: spec emit rather than anything Trivy invents.
+#:
+#: Matching on prose is unavoidable -- Trivy exits 1 for every failure and does not
+#: distinguish throttling in its exit code. It is confined here, and to a predicate
+#: with fixtures, precisely because it is the fallible part.
+#:
+#: Deliberately no bare ``"429"``: digests and layer ids routinely contain those three
+#: characters, and a false positive here defers forever without counting attempts.
+_RATE_LIMIT_MARKERS = (
+    "toomanyrequests",
+    "too many requests",
+    "pull rate limit",
+    "rate limit exceeded",
+)
+
+
+def is_rate_limit_error(message: str | None) -> bool:
+    """Whether a failed Trivy invocation failed because the registry throttled us.
+
+    A false negative costs one burnt retry attempt, which backoff already absorbs. A
+    false positive would defer forever without counting attempts, so the markers are
+    deliberately specific to throttling rather than to failure in general.
+    """
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
 
 
 @dataclass(frozen=True, slots=True)

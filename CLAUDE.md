@@ -58,7 +58,7 @@ admin shell).
 ### Verify — run all four before calling anything done
 
 ```bash
-pytest                                  # 61 with Postgres; 42 pass/19 skip without
+pytest                                  # 89 with Postgres; 70 pass/19 skip without
 ruff check app tests scripts            # must be clean
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 python scripts/verify_requirements.py --wait 900 --with-db   # e2e vs. the brief
@@ -120,7 +120,7 @@ gets mirrored into Postgres anyway, creating two sources of truth. Throughput is
 the deciding factor either way: peak is ~1.1 jobs/sec at 1000 images.
 
 **No Redis at all.** It lost its justification once the read cache was dropped. The
-remaining use would be the rate limiter, and a counter row handles that at this rate.
+last candidate use was a rate limiter, and that was deleted too — see below.
 
 **No read cache.** ~2M finding rows is unremarkable for indexed Postgres, and data
 changes only every 15 minutes. What is avoided is the invalidation surface: a missed
@@ -128,9 +128,14 @@ invalidation means serving stale vulnerability data, the one wrong answer a secu
 tool must never give. `ETag`/`Last-Modified` off the newest scan completion give the
 same benefit correct-by-construction.
 
-**The registry is the binding constraint, not the worker pool.** Registries throttle
-anonymous pulls well below 10-images-per-15-minutes sustained. Hence
-`registry_budget`.
+**The registry is the binding constraint — but it is not modelled locally.** There is
+deliberately no client-side rate limiter. One existed (`registry_budget`, a Postgres
+token bucket) and was deleted after running it: the modelled ceiling was a guess at
+Docker Hub's number, it was a second source of truth about a limit we do not own, and
+it starved the brief's own 15-minute cadence for half of every six-hour window while
+`/health` still reported `ok`. Throttling is now taken from the registry itself —
+`429` → `RateLimited(retry_after)` → `queue.defer`. **Do not reintroduce a
+client-side budget**; the README section has the measurement.
 
 **Trivy client/server, not a shared cache directory.** This was changed after
 measuring, and the measurement is the argument: the vuln DB is a single ~1.3 GB bbolt
@@ -163,7 +168,7 @@ shared cache with more than one worker.
 ## Conventions
 
 **Layout.** One concern per package: `api/` (HTTP), `domain/` (models + vocabulary),
-`scanner/` (Trivy + persistence), `scheduler/`, `jobs/` (queue), `ratelimit/`,
+`scanner/` (Trivy + persistence), `scheduler/`, `jobs/` (queue),
 `registry/`, `db/`. Business rules do not live in route handlers.
 
 **Database naming.** Singular snake_case table names (`scan_run`, not `scan_runs`).
@@ -206,16 +211,21 @@ A change is done when all of these hold:
 
 ## Things that will bite
 
-- **`app/scanner/trivy.py` is deliberately thin (~120 lines, nearly half docstring)
-  and has no test coverage** (the subprocess boundary is mocked). Do not grow it —
-  every fallible decision belongs below it in `parser.py`, which is exhaustively
-  fixture-tested.
+- **`app/scanner/trivy.py` is deliberately thin** (~135 lines, much of it docstring).
+  Only its exit-code classification is tested (`tests/test_trivy.py`), because
+  confusing registry throttling with a real failure is silent in both directions. Do
+  not grow it — every other fallible decision belongs below it in `parser.py`, which
+  is exhaustively fixture-tested. `is_rate_limit_error` lives there for exactly that
+  reason: it matches on stderr prose, so it needs fixtures.
 - **The Trivy fixtures in `tests/fixtures/trivy/` are hand-authored** to the
   documented schema, not captured from a live run. Re-capture with
   `trivy image --format json nginx:1.19` before trusting them as a regression
   baseline.
 - **`queue.defer` deliberately does not increment `attempts`.** Registry backpressure
-  is not failure and must not burn a job's retry allowance.
+  is not failure and must not burn a job's retry allowance — otherwise a throttled
+  registry walks every image to permanently failed. `RateLimited` and
+  `TrivyRateLimited` route here; both subclass an exception caught by a broader clause
+  in `worker.run_once`, so **their `except` must stay above it**.
 - **`ScanJob.image` must stay `lazy="select"`.** A joined eager load puts it on the
   nullable side of an outer join, which Postgres refuses under `FOR UPDATE`.
 - **One active job per image is enforced by a partial unique index**

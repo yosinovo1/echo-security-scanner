@@ -12,6 +12,7 @@ import pathlib
 import subprocess
 
 from app.config import Settings
+from app.scanner.parser import is_rate_limit_error
 
 
 class TrivyError(RuntimeError):
@@ -20,6 +21,15 @@ class TrivyError(RuntimeError):
 
 class TrivyTimeout(TrivyError):
     pass
+
+
+class TrivyRateLimited(TrivyError):
+    """Trivy failed because the registry throttled the pull.
+
+    Backpressure rather than failure, so the worker defers instead of spending a
+    retry. The decision of *which* failures mean this lives in ``parser`` with
+    fixtures; this module only picks the exception class.
+    """
 
 
 def scan_flags(settings: Settings) -> list[str]:
@@ -75,7 +85,10 @@ def _run(argv: list[str], timeout: int) -> str:
 
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()[:2000]
-        raise TrivyError(f"trivy exited {completed.returncode}: {detail}")
+        message = f"trivy exited {completed.returncode}: {detail}"
+        if is_rate_limit_error(detail):
+            raise TrivyRateLimited(message)
+        raise TrivyError(message)
     return completed.stdout
 
 

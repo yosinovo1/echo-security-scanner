@@ -164,8 +164,9 @@ def fail(
 def defer(session: Session, job: ScanJob, delay_seconds: int, reason: str) -> None:
     """Put a job back without counting an attempt.
 
-    Used when the registry budget is exhausted: that is backpressure, not a failure,
-    and must not burn the retry allowance.
+    Used when a registry throttles us: that is backpressure, not a failure, and must
+    not burn the retry allowance -- otherwise a throttled registry would walk every
+    image to permanently failed.
     """
     job.status = JobStatus.PENDING
     job.lease_until = None
