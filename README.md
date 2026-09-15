@@ -57,27 +57,26 @@ docker compose up -d --scale worker=6
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    SCH["scheduler<br/>advisory-locked singleton"]
+    W["worker x N<br/>one scan per process"]
+    API["api<br/>read-only, no Trivy"]
+    PG[("PostgreSQL<br/>findings AND job queue")]
+    TS["trivy-server<br/>owns the ~1.3 GB vuln DB"]
+    REG[("container registry")]
+
+    SCH -->|"INSERT scan_job, reap expired leases"| PG
+    W -->|"claim: FOR UPDATE SKIP LOCKED"| PG
+    API -->|"reads only"| PG
+    W -->|"HEAD manifest, then digest"| REG
+    W -->|"scan as a thin client"| TS
+    TS -->|"pulls layers"| REG
 ```
-                    ┌──────────────┐
-                    │  scheduler   │  advisory-locked singleton
-                    │              │  inserts due jobs, reaps dead leases
-                    └──────┬───────┘
-                           │ INSERT scan_job
-                           ▼
-  ┌────────┐        ┌──────────────┐        ┌──────────────────┐
-  │  api   │───────▶│  PostgreSQL  │◀───────│  worker × N      │
-  │        │  reads │              │ claims │  one scan/process│
-  └────────┘        │  data + queue│        └────────┬─────────┘
-                    └──────────────┘                 │ trivy image
-                                                     ▼
-                                            ┌──────────────────┐
-                                            │  image registry  │
-                                            └──────────────────┘
-                    ┌──────────────────┐
-                    │   trivy-server   │◀── workers scan through it
-                    │  owns the vuln DB│    (never open it themselves)
-                    └──────────────────┘
-```
+
+Four processes over one database. Every arrow into Postgres is the whole coordination
+mechanism: there is no broker, no leader election and no service discovery, because
+`FOR UPDATE SKIP LOCKED` and `pg_try_advisory_lock` already provide both.
 
 | Service | Role |
 |---|---|
@@ -86,6 +85,32 @@ docker compose up -d --scale worker=6
 | `worker` | Claims one job, scans, writes, repeats. Synchronous and single-job by design. |
 | `trivy-server` | Owns the vulnerability database. Workers scan through it as thin clients — see [the contention measurement](#trivy-runs-in-clientserver-mode-measured-not-assumed). |
 | `postgres` | Findings **and** the job queue. |
+
+### The life of a job
+
+Most of this system's subtlety is in which arrow a failure takes, and the three
+places an attempt can be counted:
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: scheduler finds the image due
+    pending --> running: worker claims it and takes a lease
+    running --> done: scanned, or provably skipped
+    running --> pending: registry 429, deferred, NO attempt burnt
+    running --> pending: failed under max attempts, backoff
+    running --> failed: failed at max attempts, image streak advances
+    running --> pending: lease expired, reaped, COUNTS an attempt
+    running --> failed: lease expired at max attempts
+    done --> [*]
+    failed --> [*]
+```
+
+The two shouted edges are the ones that are easy to get wrong, and both were bugs
+before they were edges. Backpressure that burns an attempt walks every image to
+permanently failed the first time a registry throttles you; a reap that does not
+consult `max_attempts` creates a job that can never give up, so a scan that kills its
+worker is re-claimed forever. See [retries back off per
+image](#retries-back-off-per-image-not-just-per-job).
 
 ---
 
@@ -635,17 +660,17 @@ immediately — it is enqueued on that tick rather than after a delay.
 ```bash
 pip install -r requirements-dev.txt
 
-pytest                                  # 201 with Postgres; 79 pass/122 skip without
+pytest                                  # 206 with Postgres; 79 pass/127 skip without
 ruff check app tests scripts            # lint
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 ```
 
-Runs without Docker: 79 tests pass and the 122 database-backed ones skip cleanly.
-With Postgres reachable, all 201 run:
+Runs without Docker: 79 tests pass and the 127 database-backed ones skip cleanly.
+With Postgres reachable, all 206 run:
 
 ```bash
 docker compose up -d postgres
-SCANNER_POSTGRES_HOST=localhost pytest      # 201 passed
+SCANNER_POSTGRES_HOST=localhost pytest      # 206 passed
 ```
 
 The database-backed tests rebuild their own `scanner_test` database from the models
