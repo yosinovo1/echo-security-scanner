@@ -8,7 +8,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from app.api.middleware import request_context, unhandled_error
-from app.api.routes import cves, health, images
+from app.api.routes import cves, health, images, stats
 from app.obs.logging import configure
 
 # Before the app is built, so that anything logged during startup already carries the
@@ -32,3 +32,4 @@ app.add_exception_handler(Exception, unhandled_error)
 app.include_router(health.router)
 app.include_router(images.router)
 app.include_router(cves.router)
+app.include_router(stats.router)

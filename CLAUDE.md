@@ -58,7 +58,7 @@ admin shell).
 ### Verify — run all four before calling anything done
 
 ```bash
-pytest                                  # 229 with Postgres; 100 pass/129 skip without
+pytest                                  # 236 with Postgres; 100 pass/136 skip without
 ruff check app tests scripts            # must be clean
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 python scripts/verify_requirements.py --wait 900 --with-db   # e2e vs. the brief
@@ -303,6 +303,10 @@ A change is done when all of these hold:
   that reason; correlation that leaks attributes one scan's failure to the next image
   in the loop, which is worse than no correlation. Tested in
   `test_logging.py::TestBinding`.
+- **`GET /api/stats` is deliberately outside the `apply_freshness` validator.** That
+  validator keys on the newest scan completion, which is right for findings and wrong
+  for queue depth — the numbers that move between scans are exactly the ones a `304`
+  would hide. It sets `Cache-Control: no-store` instead.
 - **A `StreamHandler` binds its stream at construction**, and pytest swaps stdout
   between the setup and call phases — so a handler built in a fixture writes where
   `capsys` can no longer read it. `obs.logging.make_handler(..., stream=)` exists for

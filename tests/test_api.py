@@ -67,7 +67,7 @@ def _report(*findings, digest: str):
     return ParsedReport(digest=digest, artifact_name="seeded", findings=findings)
 
 
-def _meta(digest: str) -> persist.RunMetadata:
+def _meta(digest: str | None, seconds: int = 3) -> persist.RunMetadata:
     started = datetime.now(UTC)
     return persist.RunMetadata(
         digest=digest,
@@ -75,7 +75,7 @@ def _meta(digest: str) -> persist.RunMetadata:
         trivy_db_version="2026-09-14T06:00:00Z",
         scan_flags_hash="abc123",
         started_at=started,
-        completed_at=started + timedelta(seconds=3),
+        completed_at=started + timedelta(seconds=seconds),
     )
 
 
@@ -447,3 +447,158 @@ class TestRunStatusVocabulary:
         payload = (await client.get("/api/images", params={"limit": 1000})).json()
         statuses = {i["last_scan_status"] for i in payload["items"]} - {None}
         assert statuses <= {s.value for s in RunStatus}
+
+
+class StatsWriter:
+    """Writes scan history with known shapes so the tests can assert on deltas.
+
+    Deltas rather than absolute numbers: ``GET /api/stats`` aggregates the whole
+    database by design, so it is the one endpoint here that cannot be scoped to a
+    single test's rows the way the others are by their uuid-suffixed image names.
+    """
+
+    #: Long enough to be unmistakable if it ever leaked into the percentiles.
+    FAILED_RUN_SECONDS = 600
+
+    def __init__(self, engine) -> None:
+        self.engine = engine
+        self.suffix = uuid.uuid4().hex[:10]
+        self.image_ids: list[int] = []
+        self.cve_ids: list[str] = []
+
+    def _image(self, label: str, session: Session) -> Image:
+        image = Image(name=f"test-stats-{label}-{self.suffix}", tag="1.0")
+        session.add(image)
+        session.flush()
+        self.image_ids.append(image.id)
+        return image
+
+    def _cve(self) -> str:
+        cve = f"CVE-9999-{uuid.uuid4().hex[:10]}"
+        self.cve_ids.append(cve)
+        return cve
+
+    def rescanned_image(self) -> None:
+        """An image whose first run's LOW finding is superseded by a CRITICAL."""
+        with Session(bind=self.engine, expire_on_commit=False) as session:
+            image = self._image("rescanned", session)
+            persist.record_success(
+                session,
+                image,
+                None,
+                _report(
+                    _finding(self._cve(), Severity.LOW, "oldpkg", "0.1", "debian"),
+                    digest="sha256:stats-old",
+                ),
+                _meta("sha256:stats-old"),
+            )
+            persist.record_success(
+                session,
+                image,
+                None,
+                _report(
+                    _finding(self._cve(), Severity.CRITICAL, "openssl", "1.0", "debian"),
+                    digest="sha256:stats-new",
+                ),
+                _meta("sha256:stats-new"),
+            )
+            session.commit()
+
+    def skipped_run(self) -> None:
+        with Session(bind=self.engine, expire_on_commit=False) as session:
+            image = self._image("skipped", session)
+            persist.record_skip(
+                session, image, None, _meta("sha256:stats-skip"), reason="unchanged"
+            )
+            session.commit()
+
+    def failed_run(self) -> None:
+        with Session(bind=self.engine, expire_on_commit=False) as session:
+            image = self._image("failed", session)
+            persist.record_failure(
+                session,
+                image,
+                None,
+                _meta(None, seconds=self.FAILED_RUN_SECONDS),
+                error="ImageNotFound: no such tag",
+                exhausted=True,
+            )
+            session.commit()
+
+    def cleanup(self) -> None:
+        with Session(bind=self.engine) as session:
+            session.execute(delete(Image).where(Image.id.in_(self.image_ids)))
+            session.execute(delete(Cve).where(Cve.id.in_(self.cve_ids)))
+            session.commit()
+
+
+@pytest.fixture
+def writer(engine):
+    writer = StatsWriter(engine)
+    yield writer
+    writer.cleanup()
+
+
+async def _stats(client) -> dict:
+    response = await client.get("/api/stats")
+    assert response.status_code == 200
+    return response.json()
+
+
+class TestStats:
+    async def test_findings_come_from_the_current_run_only(self, client, writer):
+        before = (await _stats(client))["findings"]
+        writer.rescanned_image()
+        after = (await _stats(client))["findings"]
+
+        # Invariant 1, read through the rollups: the superseded LOW finding is still
+        # in the table and must not be counted, or the totals report vulnerabilities
+        # that were fixed two scans ago.
+        assert after["CRITICAL"] - before["CRITICAL"] == 1
+        assert after["LOW"] == before["LOW"]
+
+    async def test_a_skip_counts_as_an_attempt_and_raises_the_skip_ratio(
+        self, client, writer
+    ):
+        before = (await _stats(client))["runs"]
+        writer.skipped_run()
+        after = (await _stats(client))["runs"]
+
+        assert after["skipped"] - before["skipped"] == 1
+        assert after["success"] == before["success"]
+        assert 0 < after["skip_ratio"] <= 1
+
+    async def test_failed_runs_are_excluded_from_the_scan_duration(self, client, writer):
+        # A failed run's duration measures how long it took to give up. Folding that
+        # into the percentiles makes them say nothing about how long a scan takes.
+        writer.failed_run()
+        durations = (await _stats(client))["scan_duration_ms"]
+        assert durations["max"] != writer.FAILED_RUN_SECONDS * 1000
+
+    async def test_failures_are_grouped_by_their_exception_class(self, client, writer):
+        writer.failed_run()
+        reasons = {row["reason"] for row in (await _stats(client))["recent_failures"]}
+        # persist writes error as "TypeName: message"; the class comes back out of it
+        # rather than being stored a second time.
+        assert "ImageNotFound" in reasons
+
+    async def test_queue_and_image_counts_are_present(self, client, writer):
+        writer.failed_run()
+        body = await _stats(client)
+        assert body["images"]["total"] >= 1
+        assert body["images"]["failing"] >= 1
+        assert body["queue"]["pending"] >= 0
+        assert body["window_hours"] == 24
+
+    async def test_the_window_is_selectable(self, client):
+        body = (await client.get("/api/stats?window_hours=1")).json()
+        assert body["window_hours"] == 1
+        assert (await client.get("/api/stats?window_hours=0")).status_code == 422
+
+    async def test_it_is_never_served_from_a_revalidated_cache(self, client):
+        # Unlike the collection endpoints: their ETag is the newest scan completion,
+        # which is correct for findings but wrong here, because queue depth and
+        # backlog age move between scans.
+        response = await client.get("/api/stats")
+        assert response.headers["cache-control"] == "no-store"
+        assert "etag" not in response.headers

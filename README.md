@@ -49,6 +49,9 @@ docker compose exec postgres psql -U scanner -d scanner \
         FROM scan_run r JOIN image i ON i.id = r.image_id
        ORDER BY r.id DESC LIMIT 20;"
 
+# Everything at once: queue depth, skip ratio, scan percentiles, failure reasons
+curl -s localhost:8000/api/stats | jq
+
 # One scan's whole lifecycle, across every process that touched it
 docker compose logs worker scheduler | grep '"job_id": 41'
 
@@ -263,6 +266,54 @@ curl -X POST "localhost:8000/api/images/nginx/1.19/scan?time_sensitive=true"
 `status` is `queued`, `promoted` (a job was already waiting and jumped the lane), or
 `already_queued`. Included because without a trigger, the priority lane would be a
 column nothing ever sets.
+
+### `GET /api/stats` *(beyond the brief)*
+
+```bash
+curl -s "localhost:8000/api/stats?window_hours=24" | jq
+```
+```json
+{
+  "generated_at": "2026-09-15T08:36:59.805Z",
+  "window_hours": 24,
+  "queue": { "pending": 0, "running": 0, "failed": 0, "oldest_pending_age_seconds": null },
+  "images": { "total": 10, "enabled": 10, "never_scanned": 0, "failing": 0 },
+  "runs": { "success": 10, "failed": 2, "skipped": 8, "skip_ratio": 0.4 },
+  "scan_duration_ms": { "count": 10, "p50": 23866, "p95": 87268, "max": 94183 },
+  "recent_failures": [
+    { "reason": "lease expired; worker presumed dead", "count": 2 }
+  ],
+  "findings": { "CRITICAL": 95, "HIGH": 769, "MEDIUM": 1188, "LOW": 679, "UNKNOWN": 21 }
+}
+```
+
+That is a real capture, not an illustration, and it is worth reading as one. The two
+failures are the two workers that were restarted mid-scan during this run: their jobs
+sat leased until `lease_until` passed, the scheduler reaped both, and the retry
+re-scanned the images successfully — the `running → pending` lease-expiry edge in
+[the diagram above](#the-life-of-a-job), end to end, visible without opening a log.
+The durations are cold: every layer was pulled for the first time, and a steady-state
+`p50` is single-digit seconds once the skip path is doing the work.
+
+Every number is a query over rows the scanner already writes — see [the scan history
+*is* the metrics store](#the-scan-history-is-the-metrics-store). Three of them are
+the ones worth watching:
+
+- **`queue.oldest_pending_age_seconds`** is the backlog signal. `pending` alone rises
+  harmlessly at every scheduler tick; this only rises when workers cannot keep up with
+  the cadence, and it is the number that says to add replicas. Deferred jobs are
+  excluded, so registry backpressure does not masquerade as a worker shortage.
+- **`runs.skip_ratio`** should be *high*. It is the content invariant proving work
+  unnecessary, and it is where the scan budget is actually saved; a ratio that
+  collapses means digests or the vulnerability DB are churning.
+- **`scan_duration_ms`** covers successful runs only. A failed run's duration measures
+  how long it took to give up and a skipped one never invoked Trivy, so including
+  either would make the percentiles say nothing about how long a scan takes.
+
+Unlike the collection endpoints this one is `Cache-Control: no-store`. Their validator
+is keyed on the newest scan completion, which is exactly right for findings — they can
+only change when a scan completes — but queue depth and backlog age move *between*
+scans, so a `304` here would hide the fastest-moving numbers on the page.
 
 ---
 
@@ -632,6 +683,31 @@ A wedged Trivy takes down one worker, not every in-flight scan on the box, and i
 removes concurrency control from the worker entirely. Scaling is replica count:
 `docker compose up --scale worker=N`.
 
+### The scan history *is* the metrics store
+
+There is no Prometheus, no StatsD and no separate time series here, and that is not
+an omission. `scan_run` already holds one durable row per attempt — outcome, error,
+digest, and wall-clock duration — because the brief's "handle scan failures
+gracefully" required queryable history rather than log lines. That table has every
+property a metrics backend is usually introduced to provide, and two it does not:
+nothing is sampled, and nothing is lost on restart.
+
+So `GET /api/stats` is six SQL queries, not an instrumentation layer. p95 scan time is
+`percentile_cont(0.95)` over successful runs; the failure breakdown is a `GROUP BY` on
+the exception class, recovered from the `"TypeName: message"` that `persist` already
+writes rather than stored a second time.
+
+The decision this really settles is that **there is one source of truth about what
+happened to a scan**. A counter incremented next to the row would be a second one, and
+the two disagree the first time a transaction rolls back — the same argument that
+[keeps the queue in Postgres](#postgres-is-the-queue) and that
+[rejected a read cache](#no-read-cache). A `/metrics` endpoint, when something
+actually scrapes, is a second *reader* of these queries: about thirty lines, and no
+new source of truth.
+
+The counterpart to that honesty: this is a pull-only view with no history of its own.
+Nothing here alerts, and `p95` over a window is not a graph over time.
+
 ### Logs are events with fields, not sentences
 
 One scan crosses three processes — the scheduler enqueues it, a worker claims and
@@ -712,17 +788,17 @@ immediately — it is enqueued on that tick rather than after a delay.
 ```bash
 pip install -r requirements-dev.txt
 
-pytest                                  # 229 with Postgres; 100 pass/129 skip without
+pytest                                  # 236 with Postgres; 100 pass/136 skip without
 ruff check app tests scripts            # lint
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 ```
 
-Runs without Docker: 100 tests pass and the 129 database-backed ones skip cleanly.
-With Postgres reachable, all 229 run:
+Runs without Docker: 100 tests pass and the 136 database-backed ones skip cleanly.
+With Postgres reachable, all 236 run:
 
 ```bash
 docker compose up -d postgres
-SCANNER_POSTGRES_HOST=localhost pytest      # 229 passed
+SCANNER_POSTGRES_HOST=localhost pytest      # 236 passed
 ```
 
 The database-backed tests rebuild their own `scanner_test` database from the models
@@ -813,6 +889,12 @@ means the stated requirements are demonstrably met.
   invocation. This is also the real answer to registry throttling at scale: an
   authenticated account, or a pull-through mirror, raises the ceiling by orders of
   magnitude where tuning a client-side limit cannot.
+- **`/api/stats` is a point-in-time view, not a time series.** It answers "what is
+  happening now, and over the last N hours" from `scan_run`, which is enough to
+  decide whether to add workers. It does not graph, alert, or retain a history of its
+  own answers, and there is no distributed tracing — see [the scan history *is* the
+  metrics store](#the-scan-history-is-the-metrics-store) for what that buys and what
+  it costs.
 - **Scaling is replica count**, a consequence of one-scan-per-process. Roughly 1000
   images at a 15-minute cadence implies dozens of worker processes — and at that
   point `trivy-server` becomes the next thing to measure, since every worker scans

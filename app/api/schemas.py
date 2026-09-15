@@ -114,3 +114,70 @@ class ScanRequestAccepted(BaseModel):
     status: str = Field(description="queued, promoted, or already_queued")
     job_id: int | None = None
     time_sensitive: bool = False
+
+
+class QueueStats(BaseModel):
+    pending: int = 0
+    running: int = 0
+    #: Jobs that exhausted their attempts. Non-zero means images are not being
+    #: scanned, and the reasons are in `recent_failures`.
+    failed: int = 0
+    #: How long the oldest unclaimed job has been waiting past its scheduled time.
+    #: The queue's backlog signal: it grows when workers cannot keep up with the
+    #: scan cadence, where `pending` alone also grows harmlessly at every tick.
+    oldest_pending_age_seconds: float | None = None
+
+
+class ImageStats(BaseModel):
+    total: int = 0
+    enabled: int = 0
+    never_scanned: int = 0
+    #: Images with a non-zero failure streak, i.e. currently on a backed-off cadence.
+    failing: int = 0
+
+
+class RunOutcomes(BaseModel):
+    """Scan attempts in the window, by outcome."""
+
+    success: int = 0
+    failed: int = 0
+    skipped: int = 0
+    #: Skips as a share of all attempts. High is healthy: it is the content invariant
+    #: proving work unnecessary, which is where the scan budget is actually saved.
+    skip_ratio: float = 0.0
+
+
+class DurationStats(BaseModel):
+    """Wall-clock scan time over successful runs in the window, in milliseconds."""
+
+    count: int = 0
+    p50: int | None = None
+    p95: int | None = None
+    max: int | None = None
+
+
+class FailureReason(BaseModel):
+    #: The exception class that ended the run. `scan_run.error` is written as
+    #: "TypeName: message", so the class is recoverable without storing it twice.
+    reason: str
+    count: int
+
+
+class Stats(BaseModel):
+    """Operational statistics, derived from scan history rather than collected.
+
+    Every number here is a query over rows the scanner already writes -- `scan_run`
+    records one row per attempt with its outcome and duration, so it is the metrics
+    store. Nothing is sampled, aggregated in memory, or lost on restart.
+    """
+
+    generated_at: datetime
+    window_hours: int
+    queue: QueueStats
+    images: ImageStats
+    runs: RunOutcomes
+    scan_duration_ms: DurationStats
+    recent_failures: list[FailureReason] = []
+    #: Live findings across every image, read from the same per-run rollups that back
+    #: GET /api/images rather than by aggregating `finding`.
+    findings: SeverityCounts = SeverityCounts()
