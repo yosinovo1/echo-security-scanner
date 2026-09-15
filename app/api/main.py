@@ -7,7 +7,13 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from app.api.middleware import request_context, unhandled_error
 from app.api.routes import cves, health, images
+from app.obs.logging import configure
+
+# Before the app is built, so that anything logged during startup already carries the
+# service field and the configured format.
+configure("api")
 
 app = FastAPI(
     title="Container Security Scanner",
@@ -19,6 +25,9 @@ app = FastAPI(
         "across every scanned image."
     ),
 )
+
+app.middleware("http")(request_context)
+app.add_exception_handler(Exception, unhandled_error)
 
 app.include_router(health.router)
 app.include_router(images.router)

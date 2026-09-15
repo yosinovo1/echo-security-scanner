@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -54,6 +55,13 @@ class Settings(BaseSettings):
     # There is deliberately no local registry rate limit. Registries publish their
     # own throttling via 429 + Retry-After, and that signal is authoritative where a
     # compiled-in ceiling is a guess that goes stale. See the README.
+
+    # Observability. JSON by default because the correlation fields exist to be
+    # filtered on -- `job_id = 41` reconstructs one scan across three processes -- and
+    # a collector should not have to parse prose to do it. `text` is for a human
+    # tailing `docker compose logs`.
+    log_level: str = "INFO"
+    log_format: Literal["json", "text"] = "json"
 
     # API pagination. The default is chosen so that an unparameterised request against
     # the brief's 10 images behaves exactly as the brief describes.

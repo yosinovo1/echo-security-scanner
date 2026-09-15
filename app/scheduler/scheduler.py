@@ -6,7 +6,6 @@ idle, so the deployment gets failover without a leader election.
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import time
 from datetime import UTC, datetime, timedelta
@@ -18,6 +17,7 @@ from app.config import Settings, get_settings
 from app.db.session import sync_session
 from app.domain.models import Image, JobStatus, ScanJob
 from app.jobs import queue
+from app.obs.logging import bound, configure
 from app.scanner import persist
 
 log = logging.getLogger("scheduler")
@@ -114,10 +114,13 @@ def record_reaped(session: Session, reaped: list[queue.ReapedJob]) -> None:
             error=queue.LEASE_EXPIRED_ERROR,
             exhausted=entry.exhausted,
         )
-        log.warning(
-            "reaped job %s on %s (exhausted=%s)",
-            entry.job_id, image.reference, entry.exhausted,
-        )
+        # Bound with the same key the worker uses, so the reap line joins the log of
+        # the scan it is cleaning up after -- which is the only record that scan left.
+        with bound(job_id=entry.job_id, image=image.reference):
+            log.warning(
+                "reaped job: worker presumed dead",
+                extra={"exhausted": entry.exhausted},
+            )
 
 
 def tick(session: Session, settings: Settings) -> int:
@@ -138,16 +141,13 @@ def tick(session: Session, settings: Settings) -> int:
         # replica got there first.
         if queue.enqueue(session, image.id):
             enqueued += 1
-            log.info("enqueued %s", image.reference)
+            log.info("enqueued", extra={"image": image.reference})
     session.commit()
     return enqueued
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure("scheduler")
     settings = get_settings()
     shutdown = _Shutdown()
 

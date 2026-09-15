@@ -15,6 +15,9 @@ invariant to ``record_skip`` rather than ``record_success``.
 """
 from __future__ import annotations
 
+import io
+import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -24,6 +27,7 @@ from app.config import Settings
 from app.domain.models import JobStatus, RunStatus, ScanJob, ScanRun
 from app.domain.severity import Severity
 from app.jobs import queue
+from app.obs.logging import make_handler
 from app.registry.digest import ImageNotFound, RateLimited, RegistryError
 from app.scanner import persist, trivy, worker
 from app.scanner.parser import ParsedFinding, ParsedReport, TrivyReportError
@@ -357,3 +361,56 @@ class TestExecuteWiring:
         assert run.digest is not None
         assert run.finding_count_critical is not None
         assert _job(session, image).status == JobStatus.DONE
+
+
+class TestCorrelation:
+    """A job's identity has to reach every line the job produces.
+
+    Not cosmetic: the log is where a scan that failed in three different processes is
+    reassembled, and the reassembly key is the job id.
+    """
+
+    def _lines(self, buffer) -> list[dict]:
+        return [json.loads(line) for line in buffer.getvalue().splitlines() if line]
+
+    @pytest.fixture
+    def captured(self):
+        buffer = io.StringIO()
+        root = logging.getLogger()
+        saved, level = root.handlers[:], root.level
+        root.handlers = [
+            make_handler("worker", Settings(log_format="json", log_level="INFO"), buffer)
+        ]
+        root.setLevel(logging.INFO)
+        yield buffer
+        root.handlers, root.level = saved, level
+
+    def test_a_failure_line_names_the_job_and_the_image(
+        self, session, image, settings, monkeypatch, captured
+    ):
+        queue.enqueue(session, image.id)
+        _fails_with(monkeypatch, RegistryError("connection reset"))
+
+        worker.run_once(session, settings)
+
+        failure = next(
+            line for line in self._lines(captured) if line["msg"] == "job failed"
+        )
+        assert failure["job_id"] == _job(session, image).id
+        assert failure["attempt"] == 0
+        assert "RegistryError" in failure["reason"]
+
+    def test_the_job_id_does_not_leak_into_the_next_iteration(
+        self, session, image, settings, monkeypatch, captured
+    ):
+        # The failure mode this guards: a contextvar set inside run_once and never
+        # unwound would tag the *next* image's lines with the previous job's id,
+        # which is worse than no correlation at all.
+        queue.enqueue(session, image.id)
+        _fails_with(monkeypatch, RegistryError("connection reset"))
+        worker.run_once(session, settings)
+
+        assert worker.run_once(session, settings) is False
+        logging.getLogger("worker").info("idle")
+
+        assert "job_id" not in self._lines(captured)[-1]

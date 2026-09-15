@@ -49,8 +49,14 @@ docker compose exec postgres psql -U scanner -d scanner \
         FROM scan_run r JOIN image i ON i.id = r.image_id
        ORDER BY r.id DESC LIMIT 20;"
 
+# One scan's whole lifecycle, across every process that touched it
+docker compose logs worker scheduler | grep '"job_id": 41'
+
 # More workers
 docker compose up -d --scale worker=6
+
+# Readable logs instead of JSON, if you are tailing them by eye
+SCANNER_LOG_FORMAT=text docker compose up
 ```
 
 ---
@@ -626,6 +632,50 @@ A wedged Trivy takes down one worker, not every in-flight scan on the box, and i
 removes concurrency control from the worker entirely. Scaling is replica count:
 `docker compose up --scale worker=N`.
 
+### Logs are events with fields, not sentences
+
+One scan crosses three processes — the scheduler enqueues it, a worker claims and
+executes it, the API later serves what it found — and what ties them together is the
+job, not any one process's lifetime. So log lines are JSON, and the worker binds
+`job_id`, `image` and `digest` into a context variable for the duration of a job:
+
+```json
+{"ts": "2026-09-15T08:17:52.271+00:00", "level": "INFO", "service": "worker",
+ "logger": "worker", "msg": "scan complete", "job_id": 8, "attempt": 0,
+ "image": "mysql:8.0", "digest": "sha256:7dcddc01f13bab2f...",
+ "findings": 215, "duration_ms": 78818}
+```
+
+`job_id` then returns that scan's whole lifecycle across processes — including the
+scheduler's own line if the worker died holding the job:
+
+```json
+{"ts": "2026-09-15T08:34:46.611+00:00", "level": "WARNING", "service": "scheduler",
+ "logger": "scheduler", "msg": "reaped job: worker presumed dead",
+ "job_id": 1, "image": "nginx:1.19", "exhausted": false}
+```
+
+The alternative — threading a logger through
+`_execute` → `persist` → `queue` — makes every function on the path know about
+logging in order to preserve one identifier; correlation is ambient to the work, so it
+is stored that way. The unit test that matters is that a bound field does *not*
+survive its block: correlation that leaks across jobs is worse than none, because it
+attributes one scan's failure to the next image in the loop.
+
+The API is the same mechanism one level up. `X-Request-ID` is honoured if the caller
+sends one and generated otherwise, echoed on the response, and attached to the single
+access line per request. It also has an error boundary, which it previously did not:
+an unhandled exception produced a bare 500 with nothing tying it to the request that
+caused it — the one place in this system where a failure left no evidence, which is
+the exact thing `scan_run` exists to prevent for scans. The body carries the request id and nothing
+else; the traceback goes to the log under that id.
+
+Tracing is deliberately absent rather than half-wired. The interesting part would be
+that the process boundary here is not an HTTP call: correlating scheduler to worker
+means persisting `traceparent` on the `scan_job` row and resuming the span when the
+job is claimed. That is a real design, and it is not worth its dependencies until
+something collects the spans.
+
 ---
 
 ## Configuration
@@ -641,6 +691,8 @@ Every setting is a `SCANNER_`-prefixed environment variable (see `app/config.py`
 | `SCANNER_MAX_ATTEMPTS` | `5` | Retries before a job is marked failed. A nonexistent image fails immediately. A registry throttling us does not count as an attempt at all. |
 | `SCANNER_MAX_FAILURE_BACKOFF_SECONDS` | `86400` | Ceiling on the per-image backoff after repeated failures. A dead reference settles at one attempt a day and still recovers on its own. |
 | `SCANNER_PAGE_SIZE_DEFAULT` / `_MAX` | `100` / `1000` | Pagination. |
+| `SCANNER_LOG_FORMAT` | `json` | `text` for a readable `docker compose logs`. |
+| `SCANNER_LOG_LEVEL` | `INFO` | `DEBUG` also surfaces the per-request access line for `/health`. |
 
 ### Adding or retuning images
 
@@ -660,17 +712,17 @@ immediately — it is enqueued on that tick rather than after a delay.
 ```bash
 pip install -r requirements-dev.txt
 
-pytest                                  # 206 with Postgres; 79 pass/127 skip without
+pytest                                  # 229 with Postgres; 100 pass/129 skip without
 ruff check app tests scripts            # lint
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 ```
 
-Runs without Docker: 79 tests pass and the 127 database-backed ones skip cleanly.
-With Postgres reachable, all 206 run:
+Runs without Docker: 100 tests pass and the 129 database-backed ones skip cleanly.
+With Postgres reachable, all 229 run:
 
 ```bash
 docker compose up -d postgres
-SCANNER_POSTGRES_HOST=localhost pytest      # 206 passed
+SCANNER_POSTGRES_HOST=localhost pytest      # 229 passed
 ```
 
 The database-backed tests rebuild their own `scanner_test` database from the models

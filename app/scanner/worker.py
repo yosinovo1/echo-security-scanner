@@ -7,7 +7,6 @@ concurrency control from this file entirely -- scale is replica count.
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import time
 from datetime import UTC, datetime
@@ -19,6 +18,7 @@ from app.config import Settings, get_settings
 from app.db.session import sync_session
 from app.domain.models import Image, JobStatus, RunStatus, ScanJob, ScanRun
 from app.jobs import queue
+from app.obs.logging import bind, bound, configure
 from app.registry.digest import (
     ImageNotFound,
     RateLimited,
@@ -90,6 +90,13 @@ def _execute(session: Session, job: ScanJob, settings: Settings) -> None:
         session.commit()
         return
 
+    # Bound rather than passed down: from here on every line -- including the failure
+    # handlers back in run_once, and anything raised deeper in persist or the parser
+    # -- names the image, and then the digest, without a single call signature
+    # growing a logging argument. Bound as early as possible for the same reason:
+    # a registry lookup that fails must still say which reference it was resolving.
+    bind(image=image.reference)
+
     # Probed per job, not once at startup: a worker outlives the vulnerability DB
     # refresh, and a stale db_version would make the skip invariant claim nothing
     # had changed when the database underneath had. The probe is a local file read.
@@ -115,6 +122,7 @@ def _execute(session: Session, job: ScanJob, settings: Settings) -> None:
     session.commit()
 
     digest = resolve_digest(reference)
+    bind(digest=digest)
 
     if _is_unchanged(previous, digest, trivy_version, db_version, flags_hash):
         # Applies to time-sensitive jobs too: urgency justifies reordering work, not
@@ -122,7 +130,7 @@ def _execute(session: Session, job: ScanJob, settings: Settings) -> None:
         persist.record_skip(session, image, job, meta(digest), reason="unchanged")
         queue.complete(session, job)
         session.commit()
-        log.info("skipped %s: digest and vulnerability DB unchanged", image.reference)
+        log.info("skipped: digest and vulnerability database unchanged")
         return
 
     raw = trivy.run_scan(image.reference, settings)
@@ -135,10 +143,8 @@ def _execute(session: Session, job: ScanJob, settings: Settings) -> None:
     queue.complete(session, job)
     session.commit()
     log.info(
-        "scanned %s: %d findings in %sms",
-        image.reference,
-        len(report.findings),
-        run_meta.duration_ms,
+        "scan complete",
+        extra={"findings": len(report.findings), "duration_ms": run_meta.duration_ms},
     )
 
 
@@ -157,7 +163,7 @@ def _defer_for_backpressure(
     delay = getattr(error, "retry_after", None) or DEFAULT_DEFER_SECONDS
     queue.defer(session, job, delay, f"{type(error).__name__}: {error}")
     session.commit()
-    log.info("deferred job %s for %ss: registry throttled us", job.id, delay)
+    log.info("deferred: registry throttled us", extra={"retry_after_seconds": delay})
 
 
 def _record_failure(
@@ -200,8 +206,8 @@ def _record_failure(
 
     session.commit()
     log.warning(
-        "job %s failed (permanent=%s, exhausted=%s): %s",
-        job.id, permanent, exhausted, message,
+        "job failed",
+        extra={"permanent": permanent, "exhausted": exhausted, "reason": message},
     )
 
 
@@ -217,32 +223,37 @@ def run_once(session: Session, settings: Settings) -> bool:
     if job is None:
         return False
 
-    try:
-        _execute(session, job, settings)
-    except ImageNotFound as exc:
-        _record_failure(session, job, exc, settings, permanent=True)
-    # Before the broader clause below: both subclass an exception listed there.
-    except (RateLimited, trivy.TrivyRateLimited) as exc:
-        _defer_for_backpressure(session, job, exc)
-    except (RegistryError, trivy.TrivyError, TrivyReportError) as exc:
-        _record_failure(session, job, exc, settings, permanent=False)
-    except Exception as exc:
-        log.exception("unexpected error on job %s", job.id)
-        _record_failure(session, job, exc, settings, permanent=False)
+    # Everything emitted below -- success, skip, defer, failure, and the handlers'
+    # own lines -- carries this job's id and attempt number, so one scan's lifecycle
+    # is recoverable from the log across all three processes that touched it.
+    with bound(job_id=job.id, attempt=job.attempts):
+        try:
+            _execute(session, job, settings)
+        except ImageNotFound as exc:
+            _record_failure(session, job, exc, settings, permanent=True)
+        # Before the broader clause below: both subclass an exception listed there.
+        except (RateLimited, trivy.TrivyRateLimited) as exc:
+            _defer_for_backpressure(session, job, exc)
+        except (RegistryError, trivy.TrivyError, TrivyReportError) as exc:
+            _record_failure(session, job, exc, settings, permanent=False)
+        except Exception as exc:
+            log.exception("unexpected error")
+            _record_failure(session, job, exc, settings, permanent=False)
     return True
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure("worker")
     settings = get_settings()
     shutdown = _Shutdown()
 
     # Probed here only to fail fast and log what we are running against; the
     # authoritative probe happens per job.
-    log.info("worker up; trivy %s, vulnerability db %s", *trivy.probe_versions(settings))
+    trivy_version, db_version = trivy.probe_versions(settings)
+    log.info(
+        "worker up",
+        extra={"trivy_version": trivy_version, "trivy_db_version": db_version},
+    )
 
     with sync_session() as session:
         while not shutdown.requested:

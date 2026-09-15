@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.db.session import sync_session
 from app.domain.models import Image
+from app.obs.logging import configure
 
 log = logging.getLogger("seed")
 
@@ -42,7 +43,7 @@ def seed() -> int:
 
 
 def main() -> None:
-    logging.basicConfig(level="INFO", format="%(levelname)s %(name)s %(message)s")
+    configure("seed")
     added = seed()
     log.info("seed complete: %d image(s) added, %d in the brief", added, len(BRIEF_IMAGES))
 

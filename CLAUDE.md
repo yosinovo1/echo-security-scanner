@@ -58,7 +58,7 @@ admin shell).
 ### Verify — run all four before calling anything done
 
 ```bash
-pytest                                  # 201 with Postgres; 79 pass/122 skip without
+pytest                                  # 229 with Postgres; 100 pass/129 skip without
 ruff check app tests scripts            # must be clean
 python scripts/check_schema_drift.py    # models vs. the hand-written migration
 python scripts/verify_requirements.py --wait 900 --with-db   # e2e vs. the brief
@@ -109,6 +109,9 @@ Four processes over one PostgreSQL database.
   executes only; it does **not** reap leases — that is administration of jobs it does
   not own, and belongs to the singleton.
 - **`app/jobs/queue.py`** — the queue *is* Postgres (`FOR UPDATE SKIP LOCKED`).
+- **`app/obs/logging.py`** — JSON logging plus the contextvar that carries
+  `job_id`/`image`/`digest` across a job. `configure(service)` is called once per
+  process entrypoint; nothing else touches `logging.basicConfig`.
 - **`trivy-server`** (compose only) — owns the vulnerability database. Workers scan
   through it as thin clients and never open the database file themselves.
 
@@ -192,7 +195,14 @@ Constraint and index prefixes are load-bearing — code references them by name 
 adding a value stays an ordinary constraint change.
 
 **Config** is `SCANNER_`-prefixed env vars, all declared in `app/config.py`. Never
-read `os.environ` elsewhere.
+read `os.environ` elsewhere — including for the log level, which is why
+`SCANNER_LOG_LEVEL` exists.
+
+**Log lines are events with fields**, not sentences: `log.info("scan complete",
+extra={"findings": n, "duration_ms": ms})`, never `log.info("scanned %s: %d findings",
+...)`. Anything already bound for the job (`image`, `digest`, `job_id`) must not be
+repeated in the message — it is on every line already. New correlation goes through
+`obs.logging.bound()` (scoped) or `bind()` (for the rest of the enclosing scope).
 
 **Comments explain *why*, never *what*.** The codebase is dense with rationale for
 non-obvious choices and has essentially no restating-the-code comments. Match that.
@@ -289,6 +299,14 @@ A change is done when all of these hold:
   fillable, but the `SET` touches all four.
 - **Queue time comparisons use `statement_timestamp()`, not `now()`.** `now()` is
   frozen at transaction start, so a job enqueued mid-transaction looks not-yet-due.
+- **A bound log field must not outlive its job.** `bound()` is a context manager for
+  that reason; correlation that leaks attributes one scan's failure to the next image
+  in the loop, which is worse than no correlation. Tested in
+  `test_logging.py::TestBinding`.
+- **A `StreamHandler` binds its stream at construction**, and pytest swaps stdout
+  between the setup and call phases — so a handler built in a fixture writes where
+  `capsys` can no longer read it. `obs.logging.make_handler(..., stream=)` exists for
+  tests to pass their own buffer.
 
 ## Known gaps
 
